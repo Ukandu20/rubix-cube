@@ -8,3 +8,4 @@ ipykernel
 python-dotenv
 requests
 pyyaml
+torch
