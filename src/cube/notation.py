@@ -10,6 +10,7 @@ from typing import Optional, Union
 
 BASE_FACES = ("U", "R", "F", "D", "L", "B")
 _MOVE_PATTERN = re.compile(r"^([URFDLB])(w)?(2|')?$")
+_SCRAMBLE_MOVES = tuple(f"{face}{suffix}" for face in BASE_FACES for suffix in ("", "'"))
 
 
 @dataclass(frozen=True)
@@ -143,15 +144,18 @@ def generate_scramble(
         raise ValueError("scramble length cannot be negative")
 
     random_source = rng if rng is not None else random
-    suffixes = ("", "'")
     tokens: list[str] = []
-    previous_face: Optional[str] = None
+    previous_token: Optional[str] = None
 
     for _ in range(length):
-        choices = [face for face in BASE_FACES if face != previous_face]
-        face = random_source.choice(choices)
-        suffix = random_source.choice(suffixes)
-        tokens.append(f"{face}{suffix}")
-        previous_face = face
+        if previous_token is None:
+            choices = list(_SCRAMBLE_MOVES)
+        else:
+            blocked_token = inverse_move(previous_token)[0].to_token()
+            choices = [move for move in _SCRAMBLE_MOVES if move != blocked_token]
+
+        token = random_source.choice(choices)
+        tokens.append(token)
+        previous_token = token
 
     return " ".join(tokens)

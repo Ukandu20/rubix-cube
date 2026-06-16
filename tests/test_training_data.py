@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cube.moves import apply_algorithm
-from cube.notation import split_algorithm
+from cube.notation import inverse_move, split_algorithm
 from cube.state import CubeState
 from data.training_data import (
     FIELDNAMES,
@@ -39,13 +39,14 @@ class TrainingDataTests(unittest.TestCase):
 
         self.assertTrue(solved.is_solved())
 
-    def test_scramble_has_no_same_face_consecutive_moves(self):
+    def test_scramble_has_no_immediate_inverse_moves(self):
         example = generate_training_example("sample-1", depth=5, rng=random.Random(3))
         moves = split_algorithm(example.scramble_moves)
 
         self.assertEqual(len(moves), 5)
         for current_move, next_move in zip(moves, moves[1:]):
-            self.assertNotEqual(current_move[0], next_move[0])
+            inverse_token = inverse_move(current_move)[0].to_token()
+            self.assertNotEqual(next_move, inverse_token)
 
     def test_unique_depth_dataset_enforces_unique_states(self):
         examples = generate_depth_dataset(

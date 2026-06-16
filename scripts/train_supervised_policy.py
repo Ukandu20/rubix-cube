@@ -19,8 +19,10 @@ from models.supervised_policy import (  # noqa: E402
     DEFAULT_OUTPUT_DIR,
     CubePolicyDataset,
     SupervisedPolicyNet,
+    bfs_agent_comparison,
     evaluate_accuracy,
     evaluate_greedy_solver,
+    inverse_scramble_comparison,
     load_training_rows,
     random_agent_comparison,
     save_artifacts,
@@ -39,6 +41,9 @@ def main() -> None:
     parser.add_argument("--solve-cap", type=int, default=30)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument("--comparison-episodes", type=int, default=20)
+    parser.add_argument("--bfs-episodes", type=int, default=1)
+    parser.add_argument("--bfs-max-depth", type=int, default=7)
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -63,12 +68,29 @@ def main() -> None:
     accuracy = evaluate_accuracy(model, validation_dataset, batch_size=args.batch_size)
     greedy = evaluate_greedy_solver(model, validation_rows, solve_cap=args.solve_cap)
     depths = sorted({int(row["scramble_depth"]) for row in validation_rows})
-    random_rows = random_agent_comparison(depths, seed=args.seed)
+    random_rows = random_agent_comparison(
+        depths,
+        episodes_per_depth=args.comparison_episodes,
+        seed=args.seed,
+    )
+    inverse_rows = inverse_scramble_comparison(
+        depths,
+        episodes_per_depth=args.comparison_episodes,
+        seed=args.seed,
+    )
+    bfs_rows = bfs_agent_comparison(
+        depths,
+        episodes_per_depth=args.bfs_episodes,
+        max_depth=args.bfs_max_depth,
+        seed=args.seed,
+    )
     metrics = {
         "history": history,
         "validation": accuracy,
         "greedy_solver": greedy,
         "random_agent_comparison": random_rows,
+        "inverse_scramble_comparison": inverse_rows,
+        "bfs_agent_comparison": bfs_rows,
     }
     config = {
         "data_dir": str(args.data_dir),
@@ -78,6 +100,9 @@ def main() -> None:
         "solve_cap": args.solve_cap,
         "learning_rate": args.learning_rate,
         "validation_fraction": args.validation_fraction,
+        "comparison_episodes": args.comparison_episodes,
+        "bfs_episodes": args.bfs_episodes,
+        "bfs_max_depth": args.bfs_max_depth,
         "train_examples": len(train_dataset),
         "validation_examples": len(validation_dataset),
     }

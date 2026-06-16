@@ -104,7 +104,15 @@ class MoveNotationTests(unittest.TestCase):
         self.assertTrue(all(is_valid_move(token) for token in tokens))
         self.assertTrue(all("2" not in token for token in tokens))
         for current_token, next_token in zip(tokens, tokens[1:]):
-            self.assertNotEqual(current_token[0], next_token[0])
+            inverse_token = inverse_move(current_token)[0].to_token()
+            self.assertNotEqual(next_token, inverse_token)
+
+    def test_generate_scramble_allows_same_face_repeats(self):
+        class FirstChoiceRng:
+            def choice(self, choices):
+                return choices[0]
+
+        self.assertEqual(generate_scramble(length=2, rng=FirstChoiceRng()), "U U")
 
     def test_invalid_scramble_options_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "size"):

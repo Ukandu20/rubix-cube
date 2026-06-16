@@ -13,7 +13,11 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from agents.evaluate import evaluate_random_agent
+from agents.evaluate import (
+    evaluate_bfs_agent,
+    evaluate_inverse_scramble_agent,
+    evaluate_random_agent,
+)
 from cube.environment import ACTION_TO_MOVE
 from cube.moves import apply_move
 from cube.state import CubeState
@@ -316,6 +320,36 @@ def random_agent_comparison(
     return evaluate_random_agent(
         depths=depths,
         episodes_per_depth=episodes_per_depth,
+        rng=random.Random(seed),
+    )
+
+
+def inverse_scramble_comparison(
+    depths: Iterable[int],
+    episodes_per_depth: int = 20,
+    seed: int = 0,
+) -> list[dict]:
+    """Run inverse-scramble oracle baseline for comparison rows."""
+
+    return evaluate_inverse_scramble_agent(
+        depths=depths,
+        episodes_per_depth=episodes_per_depth,
+        rng=random.Random(seed),
+    )
+
+
+def bfs_agent_comparison(
+    depths: Iterable[int],
+    episodes_per_depth: int = 1,
+    max_depth: int = 7,
+    seed: int = 0,
+) -> list[dict]:
+    """Run shallow BFS baseline for comparison rows."""
+
+    return evaluate_bfs_agent(
+        depths=depths,
+        episodes_per_depth=episodes_per_depth,
+        max_depth=max_depth,
         rng=random.Random(seed),
     )
 

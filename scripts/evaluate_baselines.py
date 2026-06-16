@@ -25,7 +25,7 @@ from agents.evaluate import (  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate cube baseline agents.")
-    parser.add_argument("--episodes", type=int, default=20)
+    parser.add_argument("--episodes", type=int, default=54)
     parser.add_argument("--bfs-episodes", type=int, default=1)
     parser.add_argument("--bfs-max-depth", type=int, default=7)
     parser.add_argument("--seed", type=int, default=0)
