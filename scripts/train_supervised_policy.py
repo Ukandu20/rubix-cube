@@ -15,6 +15,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from models.supervised_policy import (  # noqa: E402
+    DATA_FORMATS,
     DEFAULT_DATA_DIR,
     DEFAULT_OUTPUT_DIR,
     CubePolicyDataset,
@@ -44,10 +45,28 @@ def main() -> None:
     parser.add_argument("--comparison-episodes", type=int, default=20)
     parser.add_argument("--bfs-episodes", type=int, default=1)
     parser.add_argument("--bfs-max-depth", type=int, default=7)
+    parser.add_argument("--min-depth", type=int, default=None)
+    parser.add_argument("--max-depth", type=int, default=5)
+    parser.add_argument("--max-rows", type=int, default=None)
+    parser.add_argument("--sample-per-depth", type=int, default=None)
+    parser.add_argument(
+        "--data-format",
+        choices=DATA_FORMATS,
+        default="auto",
+        help="Training data format. auto prefers depth_N.parquet when present.",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
-    rows = load_training_rows(args.data_dir)
+    rows = load_training_rows(
+        args.data_dir,
+        min_depth=args.min_depth,
+        max_depth=args.max_depth,
+        max_rows=args.max_rows,
+        sample_per_depth=args.sample_per_depth,
+        seed=args.seed,
+        data_format=args.data_format,
+    )
     dataset = CubePolicyDataset(rows)
     train_dataset, validation_dataset = split_dataset(
         dataset,
@@ -103,6 +122,12 @@ def main() -> None:
         "comparison_episodes": args.comparison_episodes,
         "bfs_episodes": args.bfs_episodes,
         "bfs_max_depth": args.bfs_max_depth,
+        "min_depth": args.min_depth,
+        "max_depth": args.max_depth,
+        "max_rows": args.max_rows,
+        "sample_per_depth": args.sample_per_depth,
+        "data_format": args.data_format,
+        "loaded_examples": len(dataset),
         "train_examples": len(train_dataset),
         "validation_examples": len(validation_dataset),
     }

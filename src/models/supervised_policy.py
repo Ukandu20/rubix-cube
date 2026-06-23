@@ -7,7 +7,7 @@ import json
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Literal, Optional, Sequence
 
 import torch
 from torch import nn
@@ -32,6 +32,15 @@ STICKER_COUNT = 54
 INPUT_SIZE = STICKER_COUNT * len(COLOR_ORDER)
 DEFAULT_DATA_DIR = Path("data/processed/training")
 DEFAULT_OUTPUT_DIR = Path("models/artifacts/supervised")
+DATA_FORMATS = ("auto", "csv", "parquet")
+TRAINING_ROW_COLUMNS = (
+    "sample_id",
+    "scramble_depth",
+    "scramble_moves",
+    "state_encoded",
+    "solution_moves",
+    "first_solution_move",
+)
 
 
 def encode_state(state_encoded: str) -> torch.Tensor:
@@ -57,13 +66,12 @@ def encode_states(states: Sequence[str]) -> torch.Tensor:
 
 
 class CubePolicyDataset(Dataset):
-    """Torch dataset backed by generated training CSV rows."""
+    """Torch dataset backed by generated training rows."""
 
     def __init__(self, rows: Sequence[dict]) -> None:
         if not rows:
             raise ValueError("dataset rows cannot be empty")
         self.rows = list(rows)
-        self.features = encode_states([row["state_encoded"] for row in self.rows])
         self.labels = torch.tensor(
             [_label_for_move(row["first_solution_move"]) for row in self.rows],
             dtype=torch.long,
@@ -77,7 +85,7 @@ class CubePolicyDataset(Dataset):
         return len(self.rows)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.features[index], self.labels[index], self.depths[index]
+        return encode_state(self.rows[index]["state_encoded"]), self.labels[index], self.depths[index]
 
 
 class SupervisedPolicyNet(nn.Module):
@@ -102,16 +110,215 @@ class SupervisedPolicyNet(nn.Module):
         return self.network(inputs)
 
 
-def load_training_rows(data_dir: Path | str = DEFAULT_DATA_DIR) -> list[dict]:
-    """Load all depth CSV rows from a training-data directory."""
+def load_training_rows(
+    data_dir: Path | str = DEFAULT_DATA_DIR,
+    *,
+    min_depth: Optional[int] = None,
+    max_depth: Optional[int] = None,
+    max_rows: Optional[int] = None,
+    sample_per_depth: Optional[int] = None,
+    seed: int = 0,
+    data_format: Literal["auto", "csv", "parquet"] = "auto",
+) -> list[dict]:
+    """Load training rows with optional depth filtering and sampling."""
 
-    rows: list[dict] = []
-    for csv_path in sorted(Path(data_dir).glob("depth_*.csv")):
-        with csv_path.open(newline="", encoding="utf-8") as handle:
-            rows.extend(csv.DictReader(handle))
+    _validate_row_loading_options(
+        min_depth=min_depth,
+        max_depth=max_depth,
+        max_rows=max_rows,
+        sample_per_depth=sample_per_depth,
+        data_format=data_format,
+    )
+
+    files = _training_data_files(Path(data_dir), data_format, min_depth, max_depth)
+    if not files:
+        raise ValueError(f"no depth data files found in {data_dir}")
+
+    random_source = random.Random(seed)
+    columns = tuple(TRAINING_ROW_COLUMNS)
+    if max_rows is not None and sample_per_depth is None:
+        rows = _sample_rows_from_files(files, max_rows, random_source, columns)
+    else:
+        rows = []
+        for _, path in files:
+            depth_rows = _load_depth_file(path, columns, sample_per_depth, random_source)
+            rows.extend(depth_rows)
+
+        if max_rows is not None and len(rows) > max_rows:
+            rows = random_source.sample(rows, max_rows)
+
     if not rows:
-        raise ValueError(f"no depth_*.csv files found in {data_dir}")
+        raise ValueError(f"no training rows found in {data_dir}")
     return rows
+
+
+def _validate_row_loading_options(
+    *,
+    min_depth: Optional[int],
+    max_depth: Optional[int],
+    max_rows: Optional[int],
+    sample_per_depth: Optional[int],
+    data_format: str,
+) -> None:
+    if data_format not in DATA_FORMATS:
+        raise ValueError(f"data_format must be one of: {', '.join(DATA_FORMATS)}")
+    if min_depth is not None and min_depth < 0:
+        raise ValueError("min_depth cannot be negative")
+    if max_depth is not None and max_depth < 0:
+        raise ValueError("max_depth cannot be negative")
+    if min_depth is not None and max_depth is not None and min_depth > max_depth:
+        raise ValueError("min_depth cannot be greater than max_depth")
+    if max_rows is not None and max_rows <= 0:
+        raise ValueError("max_rows must be positive")
+    if sample_per_depth is not None and sample_per_depth <= 0:
+        raise ValueError("sample_per_depth must be positive")
+
+
+def _training_data_files(
+    data_dir: Path,
+    data_format: str,
+    min_depth: Optional[int],
+    max_depth: Optional[int],
+) -> list[tuple[int, Path]]:
+    if data_format == "auto":
+        parquet_by_depth = _depth_files_by_suffix(data_dir, ".parquet")
+        csv_by_depth = _depth_files_by_suffix(data_dir, ".csv")
+        depths = sorted(set(parquet_by_depth) | set(csv_by_depth))
+        return [
+            (
+                depth,
+                parquet_by_depth[depth] if depth in parquet_by_depth else csv_by_depth[depth],
+            )
+            for depth in depths
+            if _depth_allowed(depth, min_depth, max_depth)
+        ]
+
+    suffix = ".csv" if data_format == "csv" else ".parquet"
+    return [
+        (depth, path)
+        for depth, path in sorted(_depth_files_by_suffix(data_dir, suffix).items())
+        if _depth_allowed(depth, min_depth, max_depth)
+    ]
+
+
+def _depth_files_by_suffix(data_dir: Path, suffix: str) -> dict[int, Path]:
+    files: dict[int, Path] = {}
+    for path in data_dir.glob(f"depth_*{suffix}"):
+        depth = _depth_from_path(path)
+        if depth is not None:
+            files[depth] = path
+    return files
+
+
+def _depth_from_path(path: Path) -> Optional[int]:
+    try:
+        return int(path.stem.removeprefix("depth_"))
+    except ValueError:
+        return None
+
+
+def _depth_allowed(
+    depth: int,
+    min_depth: Optional[int],
+    max_depth: Optional[int],
+) -> bool:
+    if min_depth is not None and depth < min_depth:
+        return False
+    if max_depth is not None and depth > max_depth:
+        return False
+    return True
+
+
+def _load_depth_file(
+    path: Path,
+    columns: Sequence[str],
+    sample_per_depth: Optional[int],
+    random_source: random.Random,
+) -> list[dict]:
+    if path.suffix == ".csv":
+        if sample_per_depth is not None:
+            return _sample_csv_rows(path, columns, sample_per_depth, random_source)
+        return list(_iter_csv_rows(path, columns))
+    if path.suffix == ".parquet":
+        rows = _read_parquet_rows(path, columns)
+        if sample_per_depth is not None and len(rows) > sample_per_depth:
+            return random_source.sample(rows, sample_per_depth)
+        return rows
+    raise ValueError(f"unsupported training data file type: {path.suffix}")
+
+
+def _sample_rows_from_files(
+    files: Sequence[tuple[int, Path]],
+    sample_size: int,
+    random_source: random.Random,
+    columns: Sequence[str],
+) -> list[dict]:
+    reservoir: list[dict] = []
+    seen = 0
+    for _, path in files:
+        if path.suffix == ".csv":
+            iterator = _iter_csv_rows(path, columns)
+        elif path.suffix == ".parquet":
+            iterator = iter(_read_parquet_rows(path, columns))
+        else:
+            raise ValueError(f"unsupported training data file type: {path.suffix}")
+
+        for row in iterator:
+            seen += 1
+            if len(reservoir) < sample_size:
+                reservoir.append(row)
+                continue
+            replacement_index = random_source.randrange(seen)
+            if replacement_index < sample_size:
+                reservoir[replacement_index] = row
+    return reservoir
+
+
+def _sample_csv_rows(
+    path: Path,
+    columns: Sequence[str],
+    sample_size: int,
+    random_source: random.Random,
+) -> list[dict]:
+    reservoir: list[dict] = []
+    for seen, row in enumerate(_iter_csv_rows(path, columns), start=1):
+        if len(reservoir) < sample_size:
+            reservoir.append(row)
+            continue
+        replacement_index = random_source.randrange(seen)
+        if replacement_index < sample_size:
+            reservoir[replacement_index] = row
+    return reservoir
+
+
+def _iter_csv_rows(path: Path, columns: Sequence[str]) -> Iterable[dict]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            yield _compact_row(row, columns)
+
+
+def _read_parquet_rows(path: Path, columns: Sequence[str]) -> list[dict]:
+    try:
+        import pandas as pd
+    except ImportError as error:
+        raise ImportError(
+            "Parquet loading requires pandas and pyarrow. "
+            "Install dependencies with `python -m pip install -r requirements.txt`."
+        ) from error
+
+    try:
+        frame = pd.read_parquet(path, columns=list(columns))
+    except ImportError as error:
+        raise ImportError(
+            "Parquet loading requires pyarrow or fastparquet. "
+            "Install dependencies with `python -m pip install -r requirements.txt`."
+        ) from error
+    return [_compact_row(row, columns) for row in frame.to_dict(orient="records")]
+
+
+def _compact_row(row: dict, columns: Sequence[str]) -> dict:
+    return {column: row[column] for column in columns if column in row}
 
 
 def split_dataset(

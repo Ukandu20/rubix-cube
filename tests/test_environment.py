@@ -13,7 +13,7 @@ from cube.environment import (
     CubeEnvironment,
 )
 from cube.notation import is_valid_move, split_algorithm
-from cube.state import CubeState
+from cube.state import DEFAULT_COLORS, CubeState
 
 
 class CubeEnvironmentTests(unittest.TestCase):
@@ -120,12 +120,9 @@ class CubeEnvironmentTests(unittest.TestCase):
         lines = rendered.splitlines()
 
         self.assertEqual(len(lines), 9)
-        self.assertIn("W W W", lines[0])
-        self.assertIn("O O O", rendered)
-        self.assertIn("G G G", rendered)
-        self.assertIn("R R R", rendered)
-        self.assertIn("B B B", rendered)
-        self.assertIn("Y Y Y", rendered)
+        self.assertIn(_rendered_face_color("U"), lines[0])
+        for face_name in ("R", "F", "D", "L", "B"):
+            self.assertIn(_rendered_face_color(face_name), rendered)
 
     def test_copy_and_clone_are_independent(self):
         env = CubeEnvironment(rng=random.Random(7))
@@ -148,6 +145,9 @@ class CubeEnvironmentTests(unittest.TestCase):
         self.assertEqual(ACTION_TO_MOVE[0], "U")
         self.assertEqual(ACTION_TO_MOVE[11], "B'")
         self.assertEqual(MOVE_TO_ACTION["F'"], 5)
+
+def _rendered_face_color(face_name: str) -> str:
+    return " ".join(DEFAULT_COLORS[face_name] for _ in range(3))
 
 
 if __name__ == "__main__":

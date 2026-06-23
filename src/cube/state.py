@@ -13,11 +13,11 @@ Faces = Dict[FaceName, Face]
 
 FACE_ORDER: Tuple[FaceName, ...] = ("U", "R", "F", "D", "L", "B")
 DEFAULT_COLORS: Mapping[FaceName, Sticker] = {
-    "U": "W",
-    "R": "R",
+    "U": "Y",
+    "R": "O",
     "F": "G",
-    "D": "Y",
-    "L": "O",
+    "D": "W",
+    "L": "R",
     "B": "B",
 }
 CUBE_SIZE = 3
