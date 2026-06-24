@@ -1452,6 +1452,7 @@ Secondary metrics:
 
 ```text
 average reward
+time taken
 average solution length
 median solution length
 timeout rate

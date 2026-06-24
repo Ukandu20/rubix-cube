@@ -1,0 +1,863 @@
+"""Custom PyTorch PPO agent for the Gymnasium Rubik's Cube environment."""
+
+from __future__ import annotations
+
+import json
+import random
+from collections import deque
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from statistics import mean, median
+from typing import Any, Mapping, Optional
+
+import numpy as np
+import torch
+from torch import nn
+from torch.distributions import Categorical
+
+from cube.gym_environment import (
+    DEFAULT_MAX_EPISODE_STEPS,
+    DEFAULT_TRAINING_DATA_DIR,
+    RubixCubeSolveEnv,
+)
+
+
+DEFAULT_OUTPUT_DIR = Path("models/artifacts/ppo")
+DEFAULT_TOTAL_TIMESTEPS = 500_000
+DEFAULT_EVAL_FREQUENCY = 10_000
+DEFAULT_EVAL_EPISODES = 100
+OBSERVATION_SIZE = 54
+ACTION_SIZE = 12
+
+
+@dataclass(frozen=True)
+class PPOConfig:
+    """Hyperparameters for the custom PPO trainer."""
+
+    learning_rate: float = 3e-4
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_range: float = 0.2
+    n_epochs: int = 10
+    n_steps: int = 2048
+    batch_size: int = 64
+    ent_coef: float = 0.01
+    vf_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    target_kl: float | None = 0.03
+
+
+@dataclass(frozen=True)
+class NetworkConfig:
+    """Actor-critic MLP shape."""
+
+    input_dim: int = OBSERVATION_SIZE
+    hidden_layers: tuple[int, ...] = (256, 256)
+    actor_output_dim: int = ACTION_SIZE
+    critic_output_dim: int = 1
+
+
+class ActorCriticNet(nn.Module):
+    """Shared MLP feature extractor with separate actor and critic heads."""
+
+    def __init__(self, config: NetworkConfig | None = None) -> None:
+        super().__init__()
+        self.config = config or NetworkConfig()
+        layers: list[nn.Module] = []
+        previous_dim = self.config.input_dim
+        for hidden_dim in self.config.hidden_layers:
+            layers.append(nn.Linear(previous_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            previous_dim = hidden_dim
+
+        self.shared = nn.Sequential(*layers)
+        self.actor = nn.Linear(previous_dim, self.config.actor_output_dim)
+        self.critic = nn.Linear(previous_dim, self.config.critic_output_dim)
+
+    def forward(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.shared(observations)
+        logits = self.actor(features)
+        values = self.critic(features).squeeze(-1)
+        return logits, values
+
+
+class RolloutBuffer:
+    """In-memory rollout storage for one PPO update."""
+
+    def __init__(self) -> None:
+        self.clear()
+
+    def clear(self) -> None:
+        self.observations: list[np.ndarray] = []
+        self.actions: list[int] = []
+        self.rewards: list[float] = []
+        self.dones: list[bool] = []
+        self.log_probs: list[float] = []
+        self.values: list[float] = []
+        self.depths: list[int | None] = []
+        self.infos: list[dict[str, Any]] = []
+        self.returns: torch.Tensor | None = None
+        self.advantages: torch.Tensor | None = None
+
+    def __len__(self) -> int:
+        return len(self.actions)
+
+    def add(
+        self,
+        *,
+        observation: np.ndarray,
+        action: int,
+        reward: float,
+        done: bool,
+        log_prob: float,
+        value: float,
+        depth: int | None,
+        info: Mapping[str, Any],
+    ) -> None:
+        self.observations.append(np.asarray(observation, dtype=np.int8).copy())
+        self.actions.append(int(action))
+        self.rewards.append(float(reward))
+        self.dones.append(bool(done))
+        self.log_probs.append(float(log_prob))
+        self.values.append(float(value))
+        self.depths.append(None if depth is None else int(depth))
+        self.infos.append(dict(info))
+
+    def compute_returns_and_advantages(
+        self,
+        *,
+        last_value: float,
+        last_done: bool,
+        gamma: float,
+        gae_lambda: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute GAE advantages and lambda returns for the stored rollout."""
+
+        advantages = np.zeros(len(self), dtype=np.float32)
+        last_gae = 0.0
+        for step in reversed(range(len(self))):
+            if step == len(self) - 1:
+                next_value = float(last_value)
+                current_done = last_done
+            else:
+                next_value = self.values[step + 1]
+                current_done = self.dones[step]
+
+            next_non_terminal = 0.0 if current_done else 1.0
+            delta = (
+                self.rewards[step]
+                + gamma * next_value * next_non_terminal
+                - self.values[step]
+            )
+            last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
+            advantages[step] = last_gae
+
+        values = np.asarray(self.values, dtype=np.float32)
+        returns = advantages + values
+        self.advantages = torch.tensor(advantages, dtype=torch.float32)
+        self.returns = torch.tensor(returns, dtype=torch.float32)
+        return self.returns, self.advantages
+
+    def as_tensors(self, device: torch.device) -> dict[str, torch.Tensor]:
+        if self.returns is None or self.advantages is None:
+            raise ValueError("returns and advantages must be computed before batching")
+
+        return {
+            "observations": preprocess_observations(self.observations, device),
+            "actions": torch.tensor(self.actions, dtype=torch.long, device=device),
+            "old_log_probs": torch.tensor(
+                self.log_probs, dtype=torch.float32, device=device
+            ),
+            "returns": self.returns.to(device),
+            "advantages": self.advantages.to(device),
+            "values": torch.tensor(self.values, dtype=torch.float32, device=device),
+        }
+
+
+def set_random_seeds(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def state_files_for_depths(
+    min_depth: int,
+    max_depth: int,
+    data_dir: Path | str = DEFAULT_TRAINING_DATA_DIR,
+) -> dict[int, Path]:
+    """Return depth_N data paths, preferring parquet and falling back to CSV."""
+
+    if min_depth <= 0:
+        raise ValueError("min_depth must be positive")
+    if max_depth < min_depth:
+        raise ValueError("max_depth cannot be less than min_depth")
+
+    root = Path(data_dir)
+    state_files: dict[int, Path] = {}
+    for depth in range(min_depth, max_depth + 1):
+        parquet_path = root / f"depth_{depth}.parquet"
+        csv_path = root / f"depth_{depth}.csv"
+        state_files[depth] = csv_path if csv_path.exists() and not parquet_path.exists() else parquet_path
+    return state_files
+
+
+def make_training_env(
+    *,
+    min_depth: int = 1,
+    max_depth: int = 5,
+    max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
+    data_dir: Path | str = DEFAULT_TRAINING_DATA_DIR,
+    validate_dataset: bool = True,
+) -> RubixCubeSolveEnv:
+    """Create a dataset-driven training environment with uniform depth sampling."""
+
+    state_files = state_files_for_depths(min_depth, max_depth, data_dir)
+    depth_range = (min_depth, max_depth) if min_depth != max_depth else None
+    return RubixCubeSolveEnv(
+        state_files=state_files,
+        scramble_depth=min_depth if depth_range is None else None,
+        scramble_depth_range=depth_range,
+        max_episode_steps=max_episode_steps,
+        validate_dataset=validate_dataset,
+    )
+
+
+def make_eval_env(
+    *,
+    depth: int,
+    max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
+    data_dir: Path | str = DEFAULT_TRAINING_DATA_DIR,
+    validate_dataset: bool = True,
+) -> RubixCubeSolveEnv:
+    """Create a fixed-depth evaluation environment."""
+
+    return RubixCubeSolveEnv(
+        state_files=state_files_for_depths(depth, depth, data_dir),
+        scramble_depth=depth,
+        scramble_depth_range=None,
+        max_episode_steps=max_episode_steps,
+        validate_dataset=validate_dataset,
+    )
+
+
+def preprocess_observations(
+    observations: np.ndarray | list[np.ndarray],
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Convert cube observations to normalized float tensors."""
+
+    tensor = torch.as_tensor(np.asarray(observations), dtype=torch.float32)
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    tensor = tensor / 5.0
+    if device is not None:
+        tensor = tensor.to(device)
+    return tensor
+
+
+def select_action(
+    model: ActorCriticNet,
+    observation: np.ndarray,
+    device: torch.device | str | None = None,
+) -> tuple[int, float, float]:
+    """Sample a training action and return action, log prob, and value."""
+
+    run_device = torch.device(device or "cpu")
+    model.eval()
+    with torch.no_grad():
+        logits, values = model(preprocess_observations(observation, run_device))
+        distribution = Categorical(logits=logits)
+        action = distribution.sample()
+        log_prob = distribution.log_prob(action)
+    return int(action.item()), float(log_prob.item()), float(values.squeeze(0).item())
+
+
+def predict_action(
+    model: ActorCriticNet,
+    observation: np.ndarray,
+    device: torch.device | str | None = None,
+) -> int:
+    """Choose the greedy action for deterministic evaluation."""
+
+    run_device = torch.device(device or "cpu")
+    model.eval()
+    with torch.no_grad():
+        logits, _ = model(preprocess_observations(observation, run_device))
+    return int(torch.argmax(logits, dim=1).item())
+
+
+def evaluate_actions(
+    model: ActorCriticNet,
+    observations: torch.Tensor,
+    actions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Evaluate old rollout actions under the current policy."""
+
+    logits, values = model(observations)
+    distribution = Categorical(logits=logits)
+    return distribution.log_prob(actions), distribution.entropy(), values
+
+
+def collect_rollout(
+    *,
+    model: ActorCriticNet,
+    env: RubixCubeSolveEnv,
+    config: PPOConfig,
+    device: torch.device,
+    observation: np.ndarray | None = None,
+    info: dict[str, Any] | None = None,
+) -> tuple[RolloutBuffer, np.ndarray, dict[str, Any], bool, list[dict[str, Any]]]:
+    """Collect one fixed-size PPO rollout from a single environment."""
+
+    buffer = RolloutBuffer()
+    if observation is None:
+        observation, info = env.reset()
+    if info is None:
+        info = {}
+
+    done = False
+    completed_episodes: list[dict[str, Any]] = []
+    episode_reward = 0.0
+    episode_length = 0
+    episode_inverse_moves = 0
+
+    for _ in range(config.n_steps):
+        current_observation = observation.copy()
+        action, log_prob, value = select_action(model, current_observation, device)
+        next_observation, reward, terminated, truncated, next_info = env.step(action)
+        done = bool(terminated or truncated)
+
+        episode_reward += float(reward)
+        episode_length += 1
+        episode_inverse_moves += int(next_info.get("immediate_inverse_move", False))
+        buffer.add(
+            observation=current_observation,
+            action=action,
+            reward=float(reward),
+            done=done,
+            log_prob=log_prob,
+            value=value,
+            depth=next_info.get("start_depth", info.get("start_depth")),
+            info=next_info,
+        )
+
+        observation = next_observation
+        info = next_info
+        if done:
+            completed_episodes.append(
+                {
+                    "reward": episode_reward,
+                    "length": episode_length,
+                    "solved": bool(next_info.get("is_solved", False)),
+                    "timeout": next_info.get("terminated_reason") == "max_steps_reached",
+                    "inverse_moves": episode_inverse_moves,
+                    "start_depth": next_info.get("start_depth"),
+                }
+            )
+            observation, info = env.reset()
+            episode_reward = 0.0
+            episode_length = 0
+            episode_inverse_moves = 0
+
+    last_value = 0.0
+    if not done:
+        with torch.no_grad():
+            _, values = model(preprocess_observations(observation, device))
+            last_value = float(values.squeeze(0).item())
+
+    buffer.compute_returns_and_advantages(
+        last_value=last_value,
+        last_done=done,
+        gamma=config.gamma,
+        gae_lambda=config.gae_lambda,
+    )
+    return buffer, observation, info, done, completed_episodes
+
+
+def ppo_update(
+    *,
+    model: ActorCriticNet,
+    optimizer: torch.optim.Optimizer,
+    buffer: RolloutBuffer,
+    config: PPOConfig,
+    device: torch.device,
+) -> dict[str, float]:
+    """Run PPO optimization epochs over a completed rollout."""
+
+    model.train()
+    tensors = buffer.as_tensors(device)
+    advantages = tensors["advantages"]
+    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+    sample_count = len(buffer)
+    batch_size = min(config.batch_size, sample_count)
+    metrics: dict[str, list[float]] = {
+        "policy_loss": [],
+        "value_loss": [],
+        "entropy": [],
+        "approx_kl": [],
+        "clip_fraction": [],
+        "loss": [],
+    }
+
+    for _ in range(config.n_epochs):
+        permutation = torch.randperm(sample_count, device=device)
+        for start in range(0, sample_count, batch_size):
+            indices = permutation[start : start + batch_size]
+            new_log_probs, entropy, new_values = evaluate_actions(
+                model,
+                tensors["observations"][indices],
+                tensors["actions"][indices],
+            )
+            old_log_probs = tensors["old_log_probs"][indices]
+            log_ratio = new_log_probs - old_log_probs
+            ratio = torch.exp(log_ratio)
+            batch_advantages = advantages[indices]
+
+            unclipped = ratio * batch_advantages
+            clipped = (
+                torch.clamp(ratio, 1.0 - config.clip_range, 1.0 + config.clip_range)
+                * batch_advantages
+            )
+            policy_loss = -torch.min(unclipped, clipped).mean()
+            value_loss = (tensors["returns"][indices] - new_values).pow(2).mean()
+            entropy_loss = entropy.mean()
+            loss = policy_loss + config.vf_coef * value_loss - config.ent_coef * entropy_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            optimizer.step()
+
+            with torch.no_grad():
+                approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                clip_fraction = (
+                    (torch.abs(ratio - 1.0) > config.clip_range)
+                    .float()
+                    .mean()
+                )
+
+            metrics["policy_loss"].append(float(policy_loss.item()))
+            metrics["value_loss"].append(float(value_loss.item()))
+            metrics["entropy"].append(float(entropy_loss.item()))
+            metrics["approx_kl"].append(float(approx_kl.item()))
+            metrics["clip_fraction"].append(float(clip_fraction.item()))
+            metrics["loss"].append(float(loss.item()))
+
+        if config.target_kl is not None and metrics["approx_kl"]:
+            if metrics["approx_kl"][-1] > 1.5 * config.target_kl:
+                break
+
+    result = {key: mean(values) if values else 0.0 for key, values in metrics.items()}
+    result["explained_variance"] = explained_variance(
+        tensors["values"].detach().cpu().numpy(),
+        tensors["returns"].detach().cpu().numpy(),
+    )
+    return result
+
+
+def train_ppo(
+    *,
+    total_timesteps: int = DEFAULT_TOTAL_TIMESTEPS,
+    min_depth: int = 1,
+    max_depth: int = 5,
+    max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
+    data_dir: Path | str = DEFAULT_TRAINING_DATA_DIR,
+    output_dir: Path | str = DEFAULT_OUTPUT_DIR,
+    seed: int = 42,
+    device: torch.device | str | None = None,
+    eval_frequency: int = DEFAULT_EVAL_FREQUENCY,
+    eval_episodes: int = DEFAULT_EVAL_EPISODES,
+    config: PPOConfig | None = None,
+    network_config: NetworkConfig | None = None,
+    validate_dataset: bool = True,
+) -> dict[str, Any]:
+    """Train a custom PPO agent and save final/best checkpoints."""
+
+    if total_timesteps <= 0:
+        raise ValueError("total_timesteps must be positive")
+    if eval_frequency <= 0:
+        raise ValueError("eval_frequency must be positive")
+    if eval_episodes <= 0:
+        raise ValueError("eval_episodes must be positive")
+
+    ppo_config = config or PPOConfig()
+    run_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    set_random_seeds(seed)
+
+    env = make_training_env(
+        min_depth=min_depth,
+        max_depth=max_depth,
+        max_episode_steps=max_episode_steps,
+        data_dir=data_dir,
+        validate_dataset=validate_dataset,
+    )
+    env.action_space.seed(seed)
+    observation, info = env.reset(seed=seed)
+
+    model = ActorCriticNet(network_config).to(run_device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=ppo_config.learning_rate)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    history: list[dict[str, Any]] = []
+    best_solve_rate = -1.0
+    total_steps = 0
+    next_eval_step = eval_frequency
+    recent_episodes: deque[dict[str, Any]] = deque(maxlen=100)
+
+    random_baseline = evaluate_random_baseline(
+        depths=range(min_depth, max_depth + 1),
+        episodes_per_depth=max(1, min(eval_episodes, 20)),
+        max_episode_steps=max_episode_steps,
+        data_dir=data_dir,
+        seed=seed,
+        validate_dataset=validate_dataset,
+    )
+
+    while total_steps < total_timesteps:
+        rollout, observation, info, _, episodes = collect_rollout(
+            model=model,
+            env=env,
+            config=ppo_config,
+            device=run_device,
+            observation=observation,
+            info=info,
+        )
+        total_steps += len(rollout)
+        recent_episodes.extend(episodes)
+        update_metrics = ppo_update(
+            model=model,
+            optimizer=optimizer,
+            buffer=rollout,
+            config=ppo_config,
+            device=run_device,
+        )
+        update_metrics.update(_episode_window_metrics(recent_episodes))
+
+        row: dict[str, Any] = {
+            "timesteps": total_steps,
+            **update_metrics,
+        }
+
+        if total_steps >= next_eval_step or total_steps >= total_timesteps:
+            evaluation = evaluate_ppo_model(
+                model,
+                depths=range(min_depth, max_depth + 1),
+                episodes_per_depth=eval_episodes,
+                max_episode_steps=max_episode_steps,
+                data_dir=data_dir,
+                seed=seed + total_steps,
+                device=run_device,
+                validate_dataset=validate_dataset,
+            )
+            row["evaluation"] = evaluation
+            solve_rate = float(evaluation["overall"]["solve_rate"])
+            if solve_rate > best_solve_rate:
+                best_solve_rate = solve_rate
+                save_checkpoint(
+                    output_path / "best_model.pt",
+                    model=model,
+                    config=ppo_config,
+                    network_config=network_config or NetworkConfig(),
+                    metadata={"timesteps": total_steps, "evaluation": evaluation},
+                )
+            while next_eval_step <= total_steps:
+                next_eval_step += eval_frequency
+
+        history.append(row)
+        print(json.dumps(row, sort_keys=True))
+
+    final_evaluation = evaluate_ppo_model(
+        model,
+        depths=range(min_depth, max_depth + 1),
+        episodes_per_depth=eval_episodes,
+        max_episode_steps=max_episode_steps,
+        data_dir=data_dir,
+        seed=seed + total_steps + 1,
+        device=run_device,
+        validate_dataset=validate_dataset,
+    )
+    save_checkpoint(
+        output_path / "final_model.pt",
+        model=model,
+        config=ppo_config,
+        network_config=network_config or NetworkConfig(),
+        metadata={"timesteps": total_steps, "evaluation": final_evaluation},
+    )
+
+    run_config = {
+        "total_timesteps": total_timesteps,
+        "actual_timesteps": total_steps,
+        "min_depth": min_depth,
+        "max_depth": max_depth,
+        "max_episode_steps": max_episode_steps,
+        "data_dir": str(data_dir),
+        "seed": seed,
+        "device": str(run_device),
+        "ppo": asdict(ppo_config),
+        "network": _network_config_dict(network_config or NetworkConfig()),
+    }
+    metrics = {
+        "history": history,
+        "final_evaluation": final_evaluation,
+        "random_baseline": random_baseline,
+        "best_solve_rate": best_solve_rate,
+    }
+    _write_json(output_path / "config.json", run_config)
+    _write_json(output_path / "metrics.json", metrics)
+    return {
+        "model": model,
+        "config": run_config,
+        "metrics": metrics,
+        "output_dir": output_path,
+    }
+
+
+def evaluate_ppo_model(
+    model: Any,
+    *,
+    depths: range | list[int] | tuple[int, ...],
+    episodes_per_depth: int = DEFAULT_EVAL_EPISODES,
+    max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
+    data_dir: Path | str = DEFAULT_TRAINING_DATA_DIR,
+    seed: int = 0,
+    device: torch.device | str | None = None,
+    validate_dataset: bool = True,
+) -> dict[str, Any]:
+    """Evaluate a deterministic PPO policy by scramble depth."""
+
+    return _evaluate_policy(
+        model,
+        depths=depths,
+        episodes_per_depth=episodes_per_depth,
+        max_episode_steps=max_episode_steps,
+        data_dir=data_dir,
+        seed=seed,
+        device=device,
+        random_policy=False,
+        validate_dataset=validate_dataset,
+    )
+
+
+def evaluate_random_baseline(
+    *,
+    depths: range | list[int] | tuple[int, ...],
+    episodes_per_depth: int = DEFAULT_EVAL_EPISODES,
+    max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
+    data_dir: Path | str = DEFAULT_TRAINING_DATA_DIR,
+    seed: int = 0,
+    validate_dataset: bool = True,
+) -> dict[str, Any]:
+    """Evaluate uniformly random actions on the same Gymnasium environment."""
+
+    return _evaluate_policy(
+        None,
+        depths=depths,
+        episodes_per_depth=episodes_per_depth,
+        max_episode_steps=max_episode_steps,
+        data_dir=data_dir,
+        seed=seed,
+        random_policy=True,
+        validate_dataset=validate_dataset,
+    )
+
+
+def save_checkpoint(
+    path: Path | str,
+    *,
+    model: ActorCriticNet,
+    config: PPOConfig,
+    network_config: NetworkConfig,
+    metadata: Mapping[str, Any] | None = None,
+) -> Path:
+    """Save a PPO model checkpoint."""
+
+    checkpoint_path = Path(path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "ppo_config": asdict(config),
+            "network_config": _network_config_dict(network_config),
+            "metadata": dict(metadata or {}),
+        },
+        checkpoint_path,
+    )
+    return checkpoint_path
+
+
+def load_checkpoint(
+    path: Path | str,
+    *,
+    device: torch.device | str | None = None,
+) -> tuple[ActorCriticNet, dict[str, Any]]:
+    """Load a saved PPO model checkpoint."""
+
+    run_device = torch.device(device or "cpu")
+    checkpoint = torch.load(Path(path), map_location=run_device)
+    network_config = _network_config_from_dict(checkpoint.get("network_config", {}))
+    model = ActorCriticNet(network_config).to(run_device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model, checkpoint
+
+
+def explained_variance(predictions: np.ndarray, targets: np.ndarray) -> float:
+    """Return the fraction of target variance explained by predictions."""
+
+    target_variance = float(np.var(targets))
+    if target_variance == 0.0:
+        return 0.0
+    return float(1.0 - np.var(targets - predictions) / target_variance)
+
+
+def _evaluate_policy(
+    model: Any,
+    *,
+    depths: range | list[int] | tuple[int, ...],
+    episodes_per_depth: int,
+    max_episode_steps: int,
+    data_dir: Path | str,
+    seed: int,
+    random_policy: bool,
+    validate_dataset: bool,
+    device: torch.device | str | None = None,
+) -> dict[str, Any]:
+    if episodes_per_depth <= 0:
+        raise ValueError("episodes_per_depth must be positive")
+
+    by_depth: dict[str, dict[str, Any]] = {}
+    aggregate: list[dict[str, Any]] = []
+    for depth in depths:
+        env = make_eval_env(
+            depth=int(depth),
+            max_episode_steps=max_episode_steps,
+            data_dir=data_dir,
+            validate_dataset=validate_dataset,
+        )
+        env.action_space.seed(seed + int(depth))
+        depth_rows: list[dict[str, Any]] = []
+        for episode in range(episodes_per_depth):
+            observation, _ = env.reset(seed=seed + int(depth) * 10_000 + episode)
+            done = False
+            episode_reward = 0.0
+            inverse_moves = 0
+            final_info: dict[str, Any] = {}
+
+            while not done:
+                if random_policy:
+                    action = int(env.action_space.sample())
+                else:
+                    action = _policy_action(model, observation, device)
+                observation, reward, terminated, truncated, final_info = env.step(action)
+                done = bool(terminated or truncated)
+                episode_reward += float(reward)
+                inverse_moves += int(final_info.get("immediate_inverse_move", False))
+
+            solved = bool(final_info.get("is_solved", False))
+            steps = int(final_info.get("current_step", 0))
+            depth_rows.append(
+                {
+                    "reward": episode_reward,
+                    "solved": solved,
+                    "timeout": final_info.get("terminated_reason")
+                    == "max_steps_reached",
+                    "steps": steps,
+                    "solution_length": steps if solved else None,
+                    "inverse_moves": inverse_moves,
+                    "extra_moves": steps - int(depth) if solved else None,
+                }
+            )
+
+        by_depth[str(depth)] = _evaluation_metrics(depth_rows)
+        aggregate.extend(depth_rows)
+
+    return {
+        "episodes_per_depth": episodes_per_depth,
+        "by_depth": by_depth,
+        "overall": _evaluation_metrics(aggregate),
+    }
+
+
+def _policy_action(
+    model: Any,
+    observation: np.ndarray,
+    device: torch.device | str | None,
+) -> int:
+    if hasattr(model, "predict"):
+        prediction = model.predict(observation, deterministic=True)
+        if isinstance(prediction, tuple):
+            prediction = prediction[0]
+        return int(np.asarray(prediction).item())
+    return predict_action(model, observation, device)
+
+
+def _evaluation_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    solved_rows = [row for row in rows if row["solved"]]
+    solution_lengths = [
+        int(row["solution_length"])
+        for row in solved_rows
+        if row["solution_length"] is not None
+    ]
+    extra_moves = [
+        int(row["extra_moves"])
+        for row in solved_rows
+        if row["extra_moves"] is not None
+    ]
+    total_steps = sum(int(row["steps"]) for row in rows)
+    return {
+        "episodes": len(rows),
+        "solved_count": len(solved_rows),
+        "solve_rate": len(solved_rows) / len(rows) if rows else 0.0,
+        "average_reward": mean(row["reward"] for row in rows) if rows else 0.0,
+        "average_solution_length": mean(solution_lengths) if solution_lengths else None,
+        "median_solution_length": median(solution_lengths) if solution_lengths else None,
+        "timeout_rate": (
+            sum(int(row["timeout"]) for row in rows) / len(rows) if rows else 0.0
+        ),
+        "inverse_move_rate": (
+            sum(int(row["inverse_moves"]) for row in rows) / total_steps
+            if total_steps
+            else 0.0
+        ),
+        "average_extra_moves": mean(extra_moves) if extra_moves else None,
+    }
+
+
+def _episode_window_metrics(episodes: deque[dict[str, Any]]) -> dict[str, float]:
+    if not episodes:
+        return {
+            "mean_episode_reward": 0.0,
+            "mean_episode_length": 0.0,
+            "train_solve_rate": 0.0,
+        }
+    return {
+        "mean_episode_reward": mean(float(row["reward"]) for row in episodes),
+        "mean_episode_length": mean(int(row["length"]) for row in episodes),
+        "train_solve_rate": mean(float(row["solved"]) for row in episodes),
+    }
+
+
+def _network_config_dict(config: NetworkConfig) -> dict[str, Any]:
+    payload = asdict(config)
+    payload["hidden_layers"] = list(config.hidden_layers)
+    return payload
+
+
+def _network_config_from_dict(payload: Mapping[str, Any]) -> NetworkConfig:
+    return NetworkConfig(
+        input_dim=int(payload.get("input_dim", OBSERVATION_SIZE)),
+        hidden_layers=tuple(payload.get("hidden_layers", (256, 256))),
+        actor_output_dim=int(payload.get("actor_output_dim", ACTION_SIZE)),
+        critic_output_dim=int(payload.get("critic_output_dim", 1)),
+    )
+
+
+def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
