@@ -70,24 +70,28 @@ Example folder structure:
 
 ```text
 data/
-  cube_states/
-    depth_1.parquet
-    depth_2.parquet
-    depth_3.parquet
-    depth_4.parquet
-    depth_5.parquet
+  processed/
+    training/
+        parquet/
+            depth_1.parquet
+            depth_2.parquet
+            depth_3.parquet
+            depth_4.parquet
+            depth_5.parquet
 ```
 
 or:
 
 ```text
 data/
-  cube_states/
-    depth_1.csv
-    depth_2.csv
-    depth_3.csv
-    depth_4.csv
-    depth_5.csv
+  processed/
+    training/
+        csv/
+            depth_1.csv
+            depth_2.csv
+            depth_3.csv
+            depth_4.csv
+            depth_5.csv
 ```
 
 Each file contains cube states that belong to that depth.
@@ -412,14 +416,14 @@ The actions correspond to the six standard Rubik’s Cube face turns and their c
 | --------: | ---- | ---------------------------- |
 |         0 | U    | Up face clockwise            |
 |         1 | U'   | Up face counter-clockwise    |
-|         2 | D    | Down face clockwise          |
-|         3 | D'   | Down face counter-clockwise  |
-|         4 | L    | Left face clockwise          |
-|         5 | L'   | Left face counter-clockwise  |
-|         6 | R    | Right face clockwise         |
-|         7 | R'   | Right face counter-clockwise |
-|         8 | F    | Front face clockwise         |
-|         9 | F'   | Front face counter-clockwise |
+|         2 | R    | Right face clockwise         |
+|         3 | R'   | Right face counter-clockwise |
+|         4 | F    | Front face clockwise         |
+|         5 | F'   | Front face counter-clockwise |
+|         6 | D    | Down face clockwise          |
+|         7 | D'   | Down face counter-clockwise  |
+|         8 | L    | Left face clockwise          |
+|         9 | L'   | Left face counter-clockwise  |
 |        10 | B    | Back face clockwise          |
 |        11 | B'   | Back face counter-clockwise  |
 
@@ -429,14 +433,14 @@ Recommended mapping:
 ACTION_TO_MOVE = {
     0: "U",
     1: "U'",
-    2: "D",
-    3: "D'",
-    4: "L",
-    5: "L'",
-    6: "R",
-    7: "R'",
-    8: "F",
-    9: "F'",
+    2: "R",
+    3: "R'",
+    4: "F",
+    5: "F'",
+    6: "D",
+    7: "D'",
+    8: "L",
+    9: "L'",
     10: "B",
     11: "B'",
 }
@@ -478,7 +482,7 @@ def __init__(
     scramble_depth: int = 1,
     scramble_depth_range: tuple[int, int] | None = None,
     max_episode_steps: int = 50,
-    state_column: str = "encoded_state",
+    state_column: str = "state_encoded",
     file_format: str = "parquet",
     reward_config: dict | None = None,
     render_mode: str | None = None,
@@ -490,11 +494,11 @@ Example config:
 
 ```python
 state_files = {
-    1: "data/cube_states/depth_1.parquet",
-    2: "data/cube_states/depth_2.parquet",
-    3: "data/cube_states/depth_3.parquet",
-    4: "data/cube_states/depth_4.parquet",
-    5: "data/cube_states/depth_5.parquet",
+    1: "data/processed/training/parquet/depth_1.parquet",
+    2: "data/processed/training/parquet/depth_2.parquet",
+    3: "data/processed/training/parquet/depth_3.parquet",
+    4: "data/processed/training/parquet/depth_4.parquet",
+    5: "data/processed/training/parquet/depth_5.parquet",
 }
 ```
 
@@ -529,27 +533,27 @@ Minimum required column:
 
 | Column          | Required | Purpose                        |
 | --------------- | -------: | ------------------------------ |
-| `encoded_state` |      Yes | 54-character cube state string |
+| `state_encoded` |      Yes | 54-character cube state string |
 
 Recommended optional columns:
 
 | Column               |            Required | Purpose                                |
 | -------------------- | ------------------: | -------------------------------------- |
-| `depth`              | Optional but useful | Starting depth of the state            |
-| `state_id`           |            Optional | Unique ID or hash for tracking         |
-| `scramble_sequence`  |            Optional | Move sequence that generated the state |
-| `inverse_solution`   |            Optional | Known inverse solution path            |
+| `scramble_depth`     | Optional but useful | Starting depth of the state            |
+| `sample_id`          |            Optional | Unique ID or hash for tracking         |
+| `scramble_moves`     |            Optional | Move sequence that generated the state |
+| `solution_moves`     |            Optional | Known inverse solution path            |
 | `encoded_state_hash` |            Optional | Useful for uniqueness validation       |
 
-Only `encoded_state` should be used as the observation.
+Only `state_encoded` should be used as the observation.
 
 The agent should not receive:
 
 ```text
-depth
-scramble_sequence
-inverse_solution
-state_id
+scramble_depth
+scramble_moves
+solution_moves
+sample_id
 ```
 
 These can be included in the `info` dictionary for logging, debugging, and evaluation.
@@ -634,7 +638,7 @@ If `scramble_depth=3` and `scramble_depth_range=None`, then every episode starts
 Example:
 
 ```python
-env = RubiksCubeSolveEnv(
+env = RubixCubeSolveEnv(
     state_files=state_files,
     scramble_depth=3,
     scramble_depth_range=None,
@@ -649,7 +653,7 @@ If `scramble_depth_range=(1, 5)`, then each episode randomly selects one depth b
 Example:
 
 ```python
-env = RubiksCubeSolveEnv(
+env = RubixCubeSolveEnv(
     state_files=state_files,
     scramble_depth_range=(1, 5),
     max_episode_steps=50
@@ -1135,21 +1139,21 @@ Example environment configurations:
 
 ```python
 # Phase 1
-env = RubiksCubeSolveEnv(
+env = RubixCubeSolveEnv(
     state_files=state_files,
     scramble_depth=1,
     max_episode_steps=50
 )
 
 # Phase 3
-env = RubiksCubeSolveEnv(
+env = RubixCubeSolveEnv(
     state_files=state_files,
     scramble_depth_range=(1, 3),
     max_episode_steps=50
 )
 
 # Phase 5
-env = RubiksCubeSolveEnv(
+env = RubixCubeSolveEnv(
     state_files=state_files,
     scramble_depth_range=(1, 5),
     max_episode_steps=50
