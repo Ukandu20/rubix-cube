@@ -12,22 +12,26 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from models.supervised_policy import DEFAULT_DATA_DIR, TRAINING_ROW_COLUMNS  # noqa: E402
+from models.supervised_policy import (  # noqa: E402
+    DEFAULT_CSV_DATA_DIR,
+    DEFAULT_PARQUET_DATA_DIR,
+    TRAINING_ROW_COLUMNS,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert depth_N.csv training shards to depth_N.parquet."
     )
-    parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
-    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--data-dir", type=Path, default=DEFAULT_CSV_DATA_DIR)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_PARQUET_DATA_DIR)
     parser.add_argument("--chunksize", type=int, default=100_000)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     paths = convert_training_data_to_parquet(
         data_dir=args.data_dir,
-        output_dir=args.output_dir or args.data_dir,
+        output_dir=args.output_dir,
         chunksize=args.chunksize,
         overwrite=args.overwrite,
     )
@@ -36,7 +40,7 @@ def main() -> None:
 
 
 def convert_training_data_to_parquet(
-    data_dir: Path | str = DEFAULT_DATA_DIR,
+    data_dir: Path | str = DEFAULT_CSV_DATA_DIR,
     output_dir: Path | str | None = None,
     chunksize: int = 100_000,
     overwrite: bool = False,

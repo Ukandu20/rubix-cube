@@ -19,7 +19,7 @@ DEFAULT_DEPTH_COUNTS: Mapping[int, int] = {
     4: 10000,
     5: 10000,
 }
-DEFAULT_OUTPUT_DIR = Path("data/processed/training")
+DEFAULT_OUTPUT_DIR = Path("data/processed/training/csv")
 FIELDNAMES = (
     "sample_id",
     "scramble_depth",
