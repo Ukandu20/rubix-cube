@@ -1,0 +1,478 @@
+"""Gymnasium environment for dataset-driven Rubik's Cube solving."""
+
+from __future__ import annotations
+
+from collections import Counter
+from pathlib import Path
+import sys
+from typing import Any, Mapping
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import gymnasium as gym
+import numpy as np
+import pandas as pd
+from gymnasium import spaces
+from gymnasium.envs.registration import register, registry
+
+from cube.environment import ACTION_TO_MOVE
+from cube.moves import apply_move
+from cube.state import CubeState
+
+
+ENV_ID = "RubixCubeSolve-v0"
+SOLVED_STATE_STRING = "YYYYYYYYYOOOOOOOOOGGGGGGGGGWWWWWWWWWRRRRRRRRRBBBBBBBBB"
+STICKER_COUNT = 54
+DEFAULT_MAX_EPISODE_STEPS = 50
+DEFAULT_TRAINING_DATA_DIR = Path("data/processed/training/parquet")
+DEFAULT_STATE_FILES = {
+    depth: DEFAULT_TRAINING_DATA_DIR / f"depth_{depth}.parquet"
+    for depth in range(1, 6)
+}
+COLOR_TO_INT = {
+    "Y": 0,
+    "O": 1,
+    "G": 2,
+    "W": 3,
+    "R": 4,
+    "B": 5,
+}
+INT_TO_COLOR = {value: key for key, value in COLOR_TO_INT.items()}
+INVERSE_ACTION = {
+    0: 1,
+    1: 0,
+    2: 3,
+    3: 2,
+    4: 5,
+    5: 4,
+    6: 7,
+    7: 6,
+    8: 9,
+    9: 8,
+    10: 11,
+    11: 10,
+}
+DEFAULT_REWARD_CONFIG = {
+    "move_penalty": -1.0,
+    "solve_bonus": 100.0,
+    "inverse_move_penalty": -5.0,
+    "timeout_penalty": -10.0,
+}
+OPTIONAL_INFO_COLUMNS = (
+    "sample_id",
+    "scramble_depth",
+    "scramble_moves",
+    "solution_moves",
+    "first_solution_move",
+)
+
+
+class RubixCubeSolveEnv(gym.Env):
+    """Dataset-driven Gymnasium environment for solving 3x3 cube states."""
+
+    metadata = {"render_modes": ["text", "human"], "render_fps": 4}
+
+    def __init__(
+        self,
+        state_files: Mapping[int, str | Path] | None = None,
+        scramble_depth: int | None = 1,
+        scramble_depth_range: tuple[int, int] | None = None,
+        max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
+        state_column: str = "state_encoded",
+        reward_config: Mapping[str, float] | None = None,
+        render_mode: str | None = None,
+        validate_dataset: bool = True,
+    ) -> None:
+        if max_episode_steps <= 0:
+            raise ValueError("max_episode_steps must be positive")
+        if render_mode not in (None, "text", "human"):
+            raise ValueError("render_mode must be one of None, 'text', or 'human'")
+
+        configured_state_files = (
+            state_files
+            if state_files is not None
+            else _default_state_files_for(scramble_depth, scramble_depth_range)
+        )
+        self.state_files = {
+            int(depth): Path(path) for depth, path in configured_state_files.items()
+        }
+        if not self.state_files:
+            raise ValueError("state_files cannot be empty")
+
+        self.scramble_depth = scramble_depth
+        self.scramble_depth_range = scramble_depth_range
+        self.max_episode_steps = max_episode_steps
+        self.state_column = state_column
+        self.render_mode = render_mode
+        self.reward_config = {
+            **DEFAULT_REWARD_CONFIG,
+            **dict(reward_config or {}),
+        }
+        self.move_penalty = float(self.reward_config["move_penalty"])
+        self.solve_bonus = float(self.reward_config["solve_bonus"])
+        self.inverse_move_penalty = float(self.reward_config["inverse_move_penalty"])
+        self.timeout_penalty = float(self.reward_config["timeout_penalty"])
+
+        self.observation_space = spaces.Box(
+            low=0,
+            high=5,
+            shape=(STICKER_COUNT,),
+            dtype=np.int8,
+        )
+        self.action_space = spaces.Discrete(len(ACTION_TO_MOVE))
+        self.solved_state = decode_state(SOLVED_STATE_STRING)
+
+        self.states_by_depth = self._load_state_files(validate_dataset)
+        self._validate_depth_configuration()
+
+        self.cube = CubeState.solved()
+        self.cube_state = self.solved_state.copy()
+        self.current_step = 0
+        self.current_depth = 0
+        self.move_history: list[int] = []
+        self.last_action: int | None = None
+        self.last_move: str | None = None
+        self.episode_return = 0.0
+        self.episode_start_info: dict[str, Any] = {}
+
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Start a new episode from one precomputed cube state."""
+
+        super().reset(seed=seed)
+        self.current_step = 0
+        self.move_history = []
+        self.last_action = None
+        self.last_move = None
+        self.episode_return = 0.0
+        self.current_depth = self._select_depth(options)
+
+        row = self.sample_state_from_depth(self.current_depth)
+        encoded_state = str(row[self.state_column]).strip()
+        self.cube = CubeState.from_flat_string(encoded_state, 3)
+        self.cube_state = decode_state(encoded_state)
+        self.episode_start_info = self._row_metadata(row)
+
+        info = {
+            "state_source": "precomputed",
+            "start_depth": self.current_depth,
+            "encoded_state": encoded_state,
+            "current_step": self.current_step,
+            "is_solved": self.is_solved(),
+            **self.episode_start_info,
+        }
+        return self.get_observation(), info
+
+    def step(
+        self, action: int
+    ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        """Apply one cube move and return the Gymnasium step tuple."""
+
+        if not self.action_space.contains(action):
+            raise ValueError(f"Invalid action: {action}")
+
+        action = int(action)
+        immediate_inverse = (
+            self.last_action is not None
+            and action == INVERSE_ACTION[self.last_action]
+        )
+        move = ACTION_TO_MOVE[action]
+        self.cube = apply_move(self.cube, move)
+        self.cube_state = decode_state(self.cube.to_flat_string())
+        self.current_step += 1
+        self.move_history.append(action)
+
+        solved = self.is_solved()
+        reward = self.calculate_reward(
+            solved=solved,
+            immediate_inverse=immediate_inverse,
+        )
+        terminated = solved
+        truncated = self.current_step >= self.max_episode_steps and not solved
+        if truncated:
+            reward += self.timeout_penalty
+
+        self.last_action = action
+        self.last_move = move
+        self.episode_return += reward
+
+        info = {
+            "is_solved": solved,
+            "start_depth": self.current_depth,
+            "current_step": self.current_step,
+            "max_episode_steps": self.max_episode_steps,
+            "last_action": action,
+            "last_move": move,
+            "immediate_inverse_move": immediate_inverse,
+            "move_history": self.move_history.copy(),
+            "move_history_notation": [
+                ACTION_TO_MOVE[action_id] for action_id in self.move_history
+            ],
+            "episode_return": self.episode_return,
+            "terminated_reason": (
+                "solved"
+                if terminated
+                else "max_steps_reached"
+                if truncated
+                else "running"
+            ),
+            **self.episode_start_info,
+        }
+        return self.get_observation(), reward, terminated, truncated, info
+
+    def sample_state_from_depth(self, depth: int) -> pd.Series:
+        """Return one randomly selected dataset row for a depth."""
+
+        if depth not in self.states_by_depth:
+            raise ValueError(f"No precomputed states available for depth {depth}.")
+
+        frame = self.states_by_depth[depth]
+        if frame.empty:
+            raise ValueError(f"Depth {depth} file contains no states.")
+
+        random_index = int(self.np_random.integers(0, len(frame)))
+        return frame.iloc[random_index]
+
+    def calculate_reward(self, solved: bool, immediate_inverse: bool) -> float:
+        """Calculate reward before any timeout penalty is added."""
+
+        reward = self.move_penalty
+        if immediate_inverse:
+            reward += self.inverse_move_penalty
+        if solved:
+            reward += self.solve_bonus
+        return reward
+
+    def is_solved(self) -> bool:
+        """Return whether the current cube matches the configured solved state."""
+
+        return bool(np.array_equal(self.cube_state, self.solved_state))
+
+    def get_observation(self) -> np.ndarray:
+        """Return a defensive copy of the current observation."""
+
+        return self.cube_state.copy()
+
+    def render(self) -> str | None:
+        """Render the cube as text, printing it for human mode."""
+
+        text = self._render_text()
+        if self.render_mode == "human":
+            print(text)
+            return None
+        return text
+
+    def _select_depth(self, options: dict[str, Any] | None) -> int:
+        if options and "scramble_depth" in options:
+            depth = int(options["scramble_depth"])
+        elif self.scramble_depth_range is not None:
+            min_depth, max_depth = self.scramble_depth_range
+            depth = int(self.np_random.integers(min_depth, max_depth + 1))
+        else:
+            if self.scramble_depth is None:
+                raise ValueError(
+                    "scramble_depth must be set when scramble_depth_range is None"
+                )
+            depth = int(self.scramble_depth)
+
+        if depth not in self.states_by_depth:
+            raise ValueError(f"No precomputed states available for depth {depth}.")
+        return depth
+
+    def _load_state_files(self, validate_dataset: bool) -> dict[int, pd.DataFrame]:
+        states_by_depth: dict[int, pd.DataFrame] = {}
+        seen_states: set[str] = set()
+
+        for depth, path in sorted(self.state_files.items()):
+            frame = _read_state_file(path)
+            if self.state_column not in frame.columns:
+                raise ValueError(
+                    f"{path} is missing required column {self.state_column!r}"
+                )
+            if validate_dataset:
+                self._validate_state_frame(depth, path, frame, seen_states)
+            else:
+                seen_states.update(
+                    str(value).strip() for value in frame[self.state_column]
+                )
+            states_by_depth[depth] = frame.reset_index(drop=True)
+
+        return states_by_depth
+
+    def _validate_state_frame(
+        self,
+        depth: int,
+        path: Path,
+        frame: pd.DataFrame,
+        seen_states: set[str],
+    ) -> None:
+        if frame.empty:
+            raise ValueError(f"Depth {depth} file contains no states: {path}")
+
+        states = [str(value).strip() for value in frame[self.state_column]]
+        invalid_states = [
+            state for state in states if not validate_encoded_state(state)
+        ]
+        if invalid_states:
+            raise ValueError(
+                f"Depth {depth} file contains invalid encoded cube states: {path}"
+            )
+
+        duplicates = pd.Series(states).duplicated()
+        if bool(duplicates.any()):
+            raise ValueError(f"Depth {depth} file contains duplicate states: {path}")
+
+        cross_duplicates = set(states) & seen_states
+        if cross_duplicates:
+            raise ValueError(
+                f"Depth {depth} file contains states already loaded from another depth"
+            )
+
+        if SOLVED_STATE_STRING in set(states):
+            raise ValueError(f"Depth {depth} file contains the solved state: {path}")
+
+        seen_states.update(states)
+
+    def _validate_depth_configuration(self) -> None:
+        if self.scramble_depth_range is not None:
+            min_depth, max_depth = self.scramble_depth_range
+            if min_depth > max_depth:
+                raise ValueError("scramble_depth_range minimum cannot exceed maximum")
+            missing = [
+                depth
+                for depth in range(min_depth, max_depth + 1)
+                if depth not in self.states_by_depth
+            ]
+            if missing:
+                raise ValueError(
+                    f"No precomputed states available for depth(s): {missing}"
+                )
+        elif self.scramble_depth is None:
+            raise ValueError(
+                "scramble_depth must be set when scramble_depth_range is None"
+            )
+        elif int(self.scramble_depth) not in self.states_by_depth:
+            raise ValueError(
+                f"No precomputed states available for depth {self.scramble_depth}."
+            )
+
+    def _row_metadata(self, row: pd.Series) -> dict[str, Any]:
+        return {
+            column: _clean_metadata_value(row.get(column))
+            for column in OPTIONAL_INFO_COLUMNS
+            if column in row.index
+        }
+
+    def _render_text(self) -> str:
+        encoded_state = encode_state(self.cube_state)
+        lines = [
+            f"Step: {self.current_step} / {self.max_episode_steps}",
+            f"Start depth: {self.current_depth}",
+            f"Last move: {self.last_move}",
+            f"Solved: {self.is_solved()}",
+            "",
+        ]
+        for face_index in range(6):
+            start = face_index * 9
+            face = encoded_state[start : start + 9]
+            lines.append(f"Face {face_index}:")
+            for row_start in range(0, 9, 3):
+                lines.append(" ".join(face[row_start : row_start + 3]))
+            if face_index != 5:
+                lines.append("")
+        return "\n".join(lines)
+
+
+def decode_state(encoded_state: str) -> np.ndarray:
+    """Decode a 54-character cube state string into integer sticker IDs."""
+
+    encoded_state = encoded_state.strip()
+    if not validate_encoded_state(encoded_state):
+        raise ValueError("encoded_state must be a valid 54-sticker cube string")
+    return np.array(
+        [COLOR_TO_INT[color] for color in encoded_state],
+        dtype=np.int8,
+    )
+
+
+def encode_state(decoded_state: np.ndarray) -> str:
+    """Encode integer sticker IDs into a 54-character cube state string."""
+
+    values = np.asarray(decoded_state).reshape(-1)
+    if len(values) != STICKER_COUNT:
+        raise ValueError(f"decoded_state must contain {STICKER_COUNT} stickers")
+
+    invalid_values = set(int(value) for value in values) - set(INT_TO_COLOR)
+    if invalid_values:
+        raise ValueError(f"invalid sticker values: {invalid_values}")
+
+    return "".join(INT_TO_COLOR[int(value)] for value in values)
+
+
+def validate_encoded_state(encoded_state: str) -> bool:
+    """Return whether an encoded state is structurally valid."""
+
+    encoded_state = encoded_state.strip()
+    if len(encoded_state) != STICKER_COUNT:
+        return False
+    if set(encoded_state) - set(COLOR_TO_INT):
+        return False
+
+    counts = Counter(encoded_state)
+    return all(counts[color] == 9 for color in COLOR_TO_INT)
+
+
+def _read_state_file(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise ValueError(f"state file does not exist: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".parquet":
+        return pd.read_parquet(path)
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    raise ValueError(f"Unsupported state file format: {path}")
+
+
+def _default_state_files_for(
+    scramble_depth: int | None,
+    scramble_depth_range: tuple[int, int] | None,
+) -> dict[int, Path]:
+    if scramble_depth_range is not None:
+        min_depth, max_depth = scramble_depth_range
+        return {
+            depth: DEFAULT_STATE_FILES[depth]
+            for depth in range(min_depth, max_depth + 1)
+            if depth in DEFAULT_STATE_FILES
+        }
+    if scramble_depth is None:
+        return dict(DEFAULT_STATE_FILES)
+    depth = int(scramble_depth)
+    if depth in DEFAULT_STATE_FILES:
+        return {depth: DEFAULT_STATE_FILES[depth]}
+    return dict(DEFAULT_STATE_FILES)
+
+
+def _clean_metadata_value(value: Any) -> Any:
+    if pd.isna(value):
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def register_gym_environment() -> None:
+    """Register the environment ID with Gymnasium once."""
+
+    if ENV_ID not in registry:
+        register(
+            id=ENV_ID,
+            entry_point="cube.gym_environment:RubixCubeSolveEnv",
+        )
+
+
+register_gym_environment()
