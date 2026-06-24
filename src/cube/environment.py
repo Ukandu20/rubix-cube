@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import random
+import sys
+from pathlib import Path
 from typing import Dict, Optional
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cube.moves import apply_move
 from cube.notation import generate_scramble
