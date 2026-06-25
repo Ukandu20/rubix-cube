@@ -13,6 +13,12 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from agents.behavior_logging import (  # noqa: E402
+    DEFAULT_BEHAVIOR_LOG_ROOT,
+    BehaviorLogConfig,
+    BehaviorLogger,
+    timestamp_run_id,
+)
 from agents.ppo_agent import (  # noqa: E402
     DEFAULT_EVAL_EPISODES,
     evaluate_ppo_model,
@@ -35,6 +41,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None)
     parser.add_argument("--json", type=Path, default=None)
+    parser.add_argument("--log-behavior", action="store_true")
+    parser.add_argument("--logs-root", type=Path, default=DEFAULT_BEHAVIOR_LOG_ROOT)
+    parser.add_argument("--model-version", default=None)
+    parser.add_argument("--run-id", default=None)
     parser.add_argument(
         "--skip-dataset-validation",
         action="store_true",
@@ -43,6 +53,18 @@ def main() -> None:
     args = parser.parse_args()
 
     model, _ = load_checkpoint(args.checkpoint, device=args.device)
+    behavior_logger = None
+    if args.log_behavior:
+        model_version = args.model_version or args.checkpoint.parent.name
+        run_id = args.run_id or timestamp_run_id()
+        behavior_logger = BehaviorLogger(
+            BehaviorLogConfig(
+                logs_root=args.logs_root,
+                model_version=model_version,
+                run_id=run_id,
+            )
+        )
+
     results = evaluate_ppo_model(
         model,
         depths=range(args.min_depth, args.max_depth + 1),
@@ -52,8 +74,14 @@ def main() -> None:
         seed=args.seed,
         device=args.device,
         validate_dataset=not args.skip_dataset_validation,
+        behavior_logger=behavior_logger,
     )
     print(json.dumps(results, indent=2, sort_keys=True))
+    if behavior_logger is not None:
+        written_paths = behavior_logger.flush()
+        for kind, paths in written_paths.items():
+            for path in paths:
+                print(f"Wrote {kind}: {path}")
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(results, indent=2, sort_keys=True), encoding="utf-8")

@@ -16,10 +16,13 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributions import Categorical
 
+from agents.behavior_logging import BehaviorLogger, utc_timestamp
+from cube.environment import ACTION_TO_MOVE
 from cube.gym_environment import (
     DEFAULT_MAX_EPISODE_STEPS,
     DEFAULT_TRAINING_DATA_DIR,
     RubixCubeSolveEnv,
+    encode_state,
 )
 
 
@@ -678,6 +681,7 @@ def evaluate_ppo_model(
     seed: int = 0,
     device: torch.device | str | None = None,
     validate_dataset: bool = True,
+    behavior_logger: BehaviorLogger | None = None,
 ) -> dict[str, Any]:
     """Evaluate a deterministic PPO policy by scramble depth."""
 
@@ -691,6 +695,7 @@ def evaluate_ppo_model(
         device=device,
         random_policy=False,
         validate_dataset=validate_dataset,
+        behavior_logger=behavior_logger,
     )
 
 
@@ -714,6 +719,7 @@ def evaluate_random_baseline(
         seed=seed,
         random_policy=True,
         validate_dataset=validate_dataset,
+        behavior_logger=None,
     )
 
 
@@ -776,6 +782,7 @@ def _evaluate_policy(
     seed: int,
     random_policy: bool,
     validate_dataset: bool,
+    behavior_logger: BehaviorLogger | None,
     device: torch.device | str | None = None,
 ) -> dict[str, Any]:
     if episodes_per_depth <= 0:
@@ -793,36 +800,98 @@ def _evaluate_policy(
         env.action_space.seed(seed + int(depth))
         depth_rows: list[dict[str, Any]] = []
         for episode in range(episodes_per_depth):
-            observation, _ = env.reset(seed=seed + int(depth) * 10_000 + episode)
+            episode_seed = seed + int(depth) * 10_000 + episode
+            observation, reset_info = env.reset(seed=episode_seed)
             done = False
             episode_reward = 0.0
             inverse_moves = 0
             final_info: dict[str, Any] = {}
+            previous_action: int | None = None
+            moves_taken: list[str] = []
+            episode_id = f"{behavior_logger.config.run_id}-depth{depth}-episode{episode}" if behavior_logger else ""
+            episode_started_at = utc_timestamp()
 
             while not done:
+                start_state = encode_state(observation)
+                step_index = int(final_info.get("current_step", 0))
                 if random_policy:
                     action = int(env.action_space.sample())
+                    policy_debug = _empty_policy_debug()
                 else:
-                    action = _policy_action(model, observation, device)
-                observation, reward, terminated, truncated, final_info = env.step(action)
+                    action, policy_debug = _policy_decision(model, observation, device)
+                next_observation, reward, terminated, truncated, final_info = env.step(action)
                 done = bool(terminated or truncated)
                 episode_reward += float(reward)
                 inverse_moves += int(final_info.get("immediate_inverse_move", False))
+                move = ACTION_TO_MOVE[int(action)]
+                moves_taken.append(move)
+
+                if behavior_logger is not None:
+                    behavior_logger.log_step(
+                        int(depth),
+                        {
+                            "episode_id": episode_id,
+                            "step_index": step_index,
+                            "model_version": behavior_logger.config.model_version,
+                            "scramble_depth": int(depth),
+                            "start_state": start_state,
+                            "action": int(action),
+                            "move": move,
+                            "end_state": encode_state(next_observation),
+                            "reward": float(reward),
+                            "total_reward_so_far": episode_reward,
+                            "moves_used_so_far": int(final_info.get("current_step", step_index + 1)),
+                            "previous_action": previous_action,
+                            "immediate_inverse_move": bool(
+                                final_info.get("immediate_inverse_move", False)
+                            ),
+                            "solved_after_move": bool(final_info.get("is_solved", False)),
+                            "done": done,
+                            "termination_reason": final_info.get(
+                                "terminated_reason",
+                                "running",
+                            ),
+                            **policy_debug,
+                        },
+                    )
+
+                previous_action = int(action)
+                observation = next_observation
 
             solved = bool(final_info.get("is_solved", False))
             steps = int(final_info.get("current_step", 0))
+            timeout = final_info.get("terminated_reason") == "max_steps_reached"
             depth_rows.append(
                 {
                     "reward": episode_reward,
                     "solved": solved,
-                    "timeout": final_info.get("terminated_reason")
-                    == "max_steps_reached",
+                    "timeout": timeout,
                     "steps": steps,
                     "solution_length": steps if solved else None,
                     "inverse_moves": inverse_moves,
                     "extra_moves": steps - int(depth) if solved else None,
                 }
             )
+            if behavior_logger is not None:
+                behavior_logger.log_episode(
+                    int(depth),
+                    {
+                        "episode_id": episode_id,
+                        "model_version": behavior_logger.config.model_version,
+                        "scramble_depth": int(depth),
+                        "scramble_sequence": reset_info.get("scramble_moves"),
+                        "start_state": reset_info.get("encoded_state"),
+                        "solved": solved,
+                        "total_steps": steps,
+                        "total_reward": episode_reward,
+                        "timeout": timeout,
+                        "termination_reason": final_info.get("terminated_reason"),
+                        "moves_taken": " ".join(moves_taken),
+                        "moves_taken_count": len(moves_taken),
+                        "seed": episode_seed,
+                        "timestamp": episode_started_at,
+                    },
+                )
 
         by_depth[str(depth)] = _evaluation_metrics(depth_rows)
         aggregate.extend(depth_rows)
@@ -845,6 +914,54 @@ def _policy_action(
             prediction = prediction[0]
         return int(np.asarray(prediction).item())
     return predict_action(model, observation, device)
+
+
+def _policy_decision(
+    model: Any,
+    observation: np.ndarray,
+    device: torch.device | str | None,
+) -> tuple[int, dict[str, float | None]]:
+    if hasattr(model, "predict"):
+        prediction = model.predict(observation, deterministic=True)
+        if isinstance(prediction, tuple):
+            prediction = prediction[0]
+        return int(np.asarray(prediction).item()), _empty_policy_debug()
+
+    if isinstance(model, ActorCriticNet):
+        run_device = torch.device(device or "cpu")
+        model.eval()
+        with torch.no_grad():
+            logits, values = model(
+                preprocess_observations(
+                    observation,
+                    run_device,
+                    observation_encoding=model.config.observation_encoding,
+                )
+            )
+            distribution = Categorical(logits=logits)
+            probabilities = torch.softmax(logits, dim=1)
+            action = torch.argmax(logits, dim=1)
+            log_probability = distribution.log_prob(action)
+            entropy = distribution.entropy()
+
+        action_id = int(action.item())
+        return action_id, {
+            "action_probability": float(probabilities[0, action_id].item()),
+            "log_probability": float(log_probability.item()),
+            "value_estimate": float(values.squeeze(0).item()),
+            "entropy": float(entropy.item()),
+        }
+
+    return predict_action(model, observation, device), _empty_policy_debug()
+
+
+def _empty_policy_debug() -> dict[str, None]:
+    return {
+        "action_probability": None,
+        "log_probability": None,
+        "value_estimate": None,
+        "entropy": None,
+    }
 
 
 def _evaluation_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:

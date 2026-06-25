@@ -10,6 +10,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from agents.behavior_logging import BehaviorLogConfig, BehaviorLogger
 from agents.ppo_agent import (  # noqa: E402
     ActorCriticNet,
     NetworkConfig,
@@ -206,6 +207,84 @@ class PPOAgentTests(unittest.TestCase):
         self.assertIn("solve_rate", results["overall"])
         self.assertIn("inverse_move_rate", results["overall"])
 
+    def test_behavior_logging_writes_episode_and_step_parquet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_dir = root / "data"
+            logs_root = root / "data" / "logs"
+            _write_depth_csv(data_dir, 1, [_row_for_moves("R")])
+            logger = BehaviorLogger(
+                BehaviorLogConfig(
+                    logs_root=logs_root,
+                    model_version="ppo_test",
+                    run_id="run_001",
+                )
+            )
+
+            evaluate_ppo_model(
+                ActorCriticNet(NetworkConfig(hidden_layers=(16,))),
+                depths=(1,),
+                episodes_per_depth=1,
+                max_episode_steps=1,
+                data_dir=data_dir,
+                behavior_logger=logger,
+            )
+            logger.flush()
+
+            episode_path = logs_root / "ppo_test" / "run_001" / "depth_1" / "episodes.parquet"
+            step_path = logs_root / "ppo_test" / "run_001" / "depth_1" / "steps.parquet"
+            episodes = pd.read_parquet(episode_path)
+            steps = pd.read_parquet(step_path)
+
+        self.assertEqual(len(episodes), 1)
+        self.assertEqual(len(steps), 1)
+        self.assertTrue(
+            {
+                "episode_id",
+                "model_version",
+                "scramble_depth",
+                "scramble_sequence",
+                "start_state",
+                "solved",
+                "total_steps",
+                "total_reward",
+                "timeout",
+                "termination_reason",
+                "moves_taken",
+                "moves_taken_count",
+                "seed",
+                "timestamp",
+            }.issubset(episodes.columns)
+        )
+        self.assertTrue(
+            {
+                "episode_id",
+                "step_index",
+                "start_state",
+                "action",
+                "move",
+                "end_state",
+                "reward",
+                "total_reward_so_far",
+                "previous_action",
+                "immediate_inverse_move",
+                "solved_after_move",
+                "done",
+                "termination_reason",
+                "action_probability",
+                "log_probability",
+                "value_estimate",
+                "entropy",
+            }.issubset(steps.columns)
+        )
+        self.assertEqual(episodes.loc[0, "model_version"], "ppo_test")
+        self.assertEqual(episodes.loc[0, "moves_taken"], steps.loc[0, "move"])
+        self.assertEqual(int(episodes.loc[0, "moves_taken_count"]), 1)
+        self.assertEqual(len(steps.loc[0, "start_state"]), 54)
+        self.assertEqual(len(steps.loc[0, "end_state"]), 54)
+        self.assertGreaterEqual(float(steps.loc[0, "action_probability"]), 0.0)
+        self.assertLessEqual(float(steps.loc[0, "action_probability"]), 1.0)
+
     def test_one_hot_checkpoint_round_trips_encoding_config(self):
         model = ActorCriticNet(NetworkConfig(hidden_layers=(16,)))
         config = PPOConfig(n_epochs=1, n_steps=4, batch_size=2)
@@ -281,6 +360,7 @@ def _inverse_token(move: str) -> str:
 
 def _write_depth_csv(directory: Path, depth: int, rows: list[dict]) -> Path:
     path = directory / f"depth_{depth}.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
 
