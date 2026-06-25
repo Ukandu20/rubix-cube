@@ -17,6 +17,9 @@ from agents.ppo_agent import (  # noqa: E402
     DEFAULT_EVAL_FREQUENCY,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_TOTAL_TIMESTEPS,
+    NetworkConfig,
+    OBSERVATION_SIZE,
+    ONE_HOT_OBSERVATION_SIZE,
     PPOConfig,
     train_ppo,
 )
@@ -38,6 +41,12 @@ def main() -> None:
     parser.add_argument("--eval-episodes", type=int, default=DEFAULT_EVAL_EPISODES)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--observation-encoding",
+        choices=("one_hot", "normalized"),
+        default="one_hot",
+        help="PPO model input encoding. one_hot uses 324 inputs; normalized uses 54.",
+    )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
@@ -69,6 +78,14 @@ def main() -> None:
         max_grad_norm=args.max_grad_norm,
         target_kl=args.target_kl,
     )
+    network_config = NetworkConfig(
+        input_dim=(
+            ONE_HOT_OBSERVATION_SIZE
+            if args.observation_encoding == "one_hot"
+            else OBSERVATION_SIZE
+        ),
+        observation_encoding=args.observation_encoding,
+    )
     result = train_ppo(
         total_timesteps=args.total_timesteps,
         min_depth=args.min_depth,
@@ -81,6 +98,7 @@ def main() -> None:
         eval_frequency=args.eval_frequency,
         eval_episodes=args.eval_episodes,
         config=config,
+        network_config=network_config,
         validate_dataset=not args.skip_dataset_validation,
     )
     print(f"Saved PPO artifacts to {result['output_dir']}")

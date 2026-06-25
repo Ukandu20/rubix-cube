@@ -8,10 +8,11 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean, median
-from typing import Any, Mapping, Optional
+from typing import Any, Literal, Mapping, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.distributions import Categorical
 
@@ -27,7 +28,10 @@ DEFAULT_TOTAL_TIMESTEPS = 500_000
 DEFAULT_EVAL_FREQUENCY = 10_000
 DEFAULT_EVAL_EPISODES = 100
 OBSERVATION_SIZE = 54
+COLOR_COUNT = 6
+ONE_HOT_OBSERVATION_SIZE = OBSERVATION_SIZE * COLOR_COUNT
 ACTION_SIZE = 12
+ObservationEncoding = Literal["one_hot", "normalized"]
 
 
 @dataclass(frozen=True)
@@ -51,10 +55,15 @@ class PPOConfig:
 class NetworkConfig:
     """Actor-critic MLP shape."""
 
-    input_dim: int = OBSERVATION_SIZE
+    input_dim: int = ONE_HOT_OBSERVATION_SIZE
     hidden_layers: tuple[int, ...] = (256, 256)
     actor_output_dim: int = ACTION_SIZE
     critic_output_dim: int = 1
+    observation_encoding: ObservationEncoding = "one_hot"
+
+    def __post_init__(self) -> None:
+        if self.observation_encoding not in ("one_hot", "normalized"):
+            raise ValueError("observation_encoding must be 'one_hot' or 'normalized'")
 
 
 class ActorCriticNet(nn.Module):
@@ -158,12 +167,20 @@ class RolloutBuffer:
         self.returns = torch.tensor(returns, dtype=torch.float32)
         return self.returns, self.advantages
 
-    def as_tensors(self, device: torch.device) -> dict[str, torch.Tensor]:
+    def as_tensors(
+        self,
+        device: torch.device,
+        observation_encoding: ObservationEncoding = "one_hot",
+    ) -> dict[str, torch.Tensor]:
         if self.returns is None or self.advantages is None:
             raise ValueError("returns and advantages must be computed before batching")
 
         return {
-            "observations": preprocess_observations(self.observations, device),
+            "observations": preprocess_observations(
+                self.observations,
+                device,
+                observation_encoding=observation_encoding,
+            ),
             "actions": torch.tensor(self.actions, dtype=torch.long, device=device),
             "old_log_probs": torch.tensor(
                 self.log_probs, dtype=torch.float32, device=device
@@ -247,13 +264,26 @@ def make_eval_env(
 def preprocess_observations(
     observations: np.ndarray | list[np.ndarray],
     device: torch.device | str | None = None,
+    observation_encoding: ObservationEncoding = "one_hot",
 ) -> torch.Tensor:
-    """Convert cube observations to normalized float tensors."""
+    """Convert cube observations to model-ready float tensors."""
 
-    tensor = torch.as_tensor(np.asarray(observations), dtype=torch.float32)
-    if tensor.ndim == 1:
-        tensor = tensor.unsqueeze(0)
-    tensor = tensor / 5.0
+    if observation_encoding not in ("one_hot", "normalized"):
+        raise ValueError("observation_encoding must be 'one_hot' or 'normalized'")
+
+    array = np.asarray(observations)
+    if array.ndim == 1:
+        array = array.reshape(1, -1)
+    if array.shape[-1] != OBSERVATION_SIZE:
+        raise ValueError(f"observations must have {OBSERVATION_SIZE} stickers")
+
+    if observation_encoding == "one_hot":
+        sticker_tensor = torch.as_tensor(array, dtype=torch.long)
+        tensor = F.one_hot(sticker_tensor, num_classes=COLOR_COUNT).to(torch.float32)
+        tensor = tensor.reshape(tensor.shape[0], ONE_HOT_OBSERVATION_SIZE)
+    else:
+        tensor = torch.as_tensor(array, dtype=torch.float32) / float(COLOR_COUNT - 1)
+
     if device is not None:
         tensor = tensor.to(device)
     return tensor
@@ -269,7 +299,13 @@ def select_action(
     run_device = torch.device(device or "cpu")
     model.eval()
     with torch.no_grad():
-        logits, values = model(preprocess_observations(observation, run_device))
+        logits, values = model(
+            preprocess_observations(
+                observation,
+                run_device,
+                observation_encoding=model.config.observation_encoding,
+            )
+        )
         distribution = Categorical(logits=logits)
         action = distribution.sample()
         log_prob = distribution.log_prob(action)
@@ -286,7 +322,13 @@ def predict_action(
     run_device = torch.device(device or "cpu")
     model.eval()
     with torch.no_grad():
-        logits, _ = model(preprocess_observations(observation, run_device))
+        logits, _ = model(
+            preprocess_observations(
+                observation,
+                run_device,
+                observation_encoding=model.config.observation_encoding,
+            )
+        )
     return int(torch.argmax(logits, dim=1).item())
 
 
@@ -366,7 +408,13 @@ def collect_rollout(
     last_value = 0.0
     if not done:
         with torch.no_grad():
-            _, values = model(preprocess_observations(observation, device))
+            _, values = model(
+                preprocess_observations(
+                    observation,
+                    device,
+                    observation_encoding=model.config.observation_encoding,
+                )
+            )
             last_value = float(values.squeeze(0).item())
 
     buffer.compute_returns_and_advantages(
@@ -389,7 +437,10 @@ def ppo_update(
     """Run PPO optimization epochs over a completed rollout."""
 
     model.train()
-    tensors = buffer.as_tensors(device)
+    tensors = buffer.as_tensors(
+        device,
+        observation_encoding=model.config.observation_encoding,
+    )
     advantages = tensors["advantages"]
     advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
     sample_count = len(buffer)
@@ -849,11 +900,18 @@ def _network_config_dict(config: NetworkConfig) -> dict[str, Any]:
 
 
 def _network_config_from_dict(payload: Mapping[str, Any]) -> NetworkConfig:
+    input_dim = int(payload.get("input_dim", ONE_HOT_OBSERVATION_SIZE))
+    if "observation_encoding" in payload:
+        observation_encoding = payload["observation_encoding"]
+    else:
+        observation_encoding = "normalized" if input_dim == OBSERVATION_SIZE else "one_hot"
+
     return NetworkConfig(
-        input_dim=int(payload.get("input_dim", OBSERVATION_SIZE)),
+        input_dim=input_dim,
         hidden_layers=tuple(payload.get("hidden_layers", (256, 256))),
         actor_output_dim=int(payload.get("actor_output_dim", ACTION_SIZE)),
         critic_output_dim=int(payload.get("critic_output_dim", 1)),
+        observation_encoding=observation_encoding,
     )
 
 

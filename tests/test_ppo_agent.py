@@ -13,13 +13,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agents.ppo_agent import (  # noqa: E402
     ActorCriticNet,
     NetworkConfig,
+    OBSERVATION_SIZE,
+    ONE_HOT_OBSERVATION_SIZE,
     PPOConfig,
     RolloutBuffer,
     evaluate_ppo_model,
     evaluate_random_baseline,
+    load_checkpoint,
     ppo_update,
     predict_action,
     preprocess_observations,
+    save_checkpoint,
     select_action,
 )
 from cube.gym_environment import SOLVED_STATE_STRING, decode_state
@@ -35,7 +39,22 @@ class AlwaysRPrimePolicy:
 class PPOAgentTests(unittest.TestCase):
     def test_network_forward_shapes(self):
         model = ActorCriticNet(NetworkConfig(hidden_layers=(32, 16)))
-        observations = torch.zeros((4, 54), dtype=torch.float32)
+        observations = torch.zeros((4, ONE_HOT_OBSERVATION_SIZE), dtype=torch.float32)
+
+        logits, values = model(observations)
+
+        self.assertEqual(tuple(logits.shape), (4, 12))
+        self.assertEqual(tuple(values.shape), (4,))
+
+    def test_normalized_network_forward_shapes(self):
+        model = ActorCriticNet(
+            NetworkConfig(
+                input_dim=OBSERVATION_SIZE,
+                hidden_layers=(32,),
+                observation_encoding="normalized",
+            )
+        )
+        observations = torch.zeros((4, OBSERVATION_SIZE), dtype=torch.float32)
 
         logits, values = model(observations)
 
@@ -56,10 +75,22 @@ class PPOAgentTests(unittest.TestCase):
         self.assertIsInstance(log_prob, float)
         self.assertIsInstance(value, float)
 
-    def test_preprocess_normalizes_observations(self):
+    def test_preprocess_one_hot_observations_by_default(self):
         observation = np.array([0, 5] * 27, dtype=np.int8)
 
         tensor = preprocess_observations(observation)
+
+        self.assertEqual(tuple(tensor.shape), (1, ONE_HOT_OBSERVATION_SIZE))
+        self.assertEqual(float(tensor.sum().item()), 54.0)
+        self.assertEqual(set(tensor.unique().tolist()), {0.0, 1.0})
+
+    def test_preprocess_normalizes_observations_when_requested(self):
+        observation = np.array([0, 5] * 27, dtype=np.int8)
+
+        tensor = preprocess_observations(
+            observation,
+            observation_encoding="normalized",
+        )
 
         self.assertEqual(tuple(tensor.shape), (1, 54))
         self.assertEqual(float(tensor.min().item()), 0.0)
@@ -174,6 +205,57 @@ class PPOAgentTests(unittest.TestCase):
         self.assertIn("1", results["by_depth"])
         self.assertIn("solve_rate", results["overall"])
         self.assertIn("inverse_move_rate", results["overall"])
+
+    def test_one_hot_checkpoint_round_trips_encoding_config(self):
+        model = ActorCriticNet(NetworkConfig(hidden_layers=(16,)))
+        config = PPOConfig(n_epochs=1, n_steps=4, batch_size=2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.pt"
+            save_checkpoint(
+                path,
+                model=model,
+                config=config,
+                network_config=model.config,
+            )
+
+            loaded_model, checkpoint = load_checkpoint(path)
+
+        self.assertEqual(loaded_model.config.input_dim, ONE_HOT_OBSERVATION_SIZE)
+        self.assertEqual(loaded_model.config.observation_encoding, "one_hot")
+        self.assertEqual(checkpoint["network_config"]["observation_encoding"], "one_hot")
+
+    def test_old_normalized_checkpoint_without_encoding_loads(self):
+        model = ActorCriticNet(
+            NetworkConfig(
+                input_dim=OBSERVATION_SIZE,
+                hidden_layers=(16,),
+                observation_encoding="normalized",
+            )
+        )
+        old_network_config = {
+            "input_dim": OBSERVATION_SIZE,
+            "hidden_layers": [16],
+            "actor_output_dim": 12,
+            "critic_output_dim": 1,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old_model.pt"
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "ppo_config": {},
+                    "network_config": old_network_config,
+                    "metadata": {},
+                },
+                path,
+            )
+
+            loaded_model, _ = load_checkpoint(path)
+
+        self.assertEqual(loaded_model.config.input_dim, OBSERVATION_SIZE)
+        self.assertEqual(loaded_model.config.observation_encoding, "normalized")
 
 
 def _row_for_moves(moves: str, depth: int | None = None) -> dict:
