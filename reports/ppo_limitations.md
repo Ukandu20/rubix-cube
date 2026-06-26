@@ -30,6 +30,21 @@ For depth-1 states, the optimal behavior is to choose the exact inverse of the s
 
 That behavior explains why solve rate can improve while exact first-move accuracy remains low.
 
+## Action-Subset Collapse
+
+The `depth_1_onehot/v002` run shows a stronger version of the same limitation. Its final deterministic evaluation reached an `83.4%` solve rate, but several legal moves were never selected at all:
+
+```text
+unused actions: B', D, F', L, L', R, U'
+used actions: B, D', F, R', U
+```
+
+This is not caused by missing legal actions in the environment. The action space still exposes all 12 quarter-turn moves, and the random baseline uses all 12. It is also not explained by the depth-1 dataset, which contains one example for each single-move scramble and one corresponding first solution move for each action.
+
+The likely cause is policy collapse under deterministic evaluation. Evaluation uses the greedy `argmax` action, so an action can have nonzero probability during training but still appear zero times in `action_counts` if it is never the top-scoring action for any evaluated state. The learned policy can also exploit cube equivalences, such as using `U U U` instead of selecting `U'` directly. This can solve some states while still avoiding the correct one-move inverse action.
+
+The `inverse_move_rate` metric needs careful interpretation here. A value of `0.0` does not necessarily mean the policy learned a better solver. It may mean the policy learned to avoid immediate undo pairs, while also suppressing useful inverse-labeled actions. The current inverse penalty only applies when an action immediately reverses the previous action; it does not penalize selecting an inverse-labeled action on the first move. Even so, the penalty may indirectly reinforce habits that avoid direct inverse choices after the policy begins favoring repeated same-direction turns.
+
 ## Likely Input Issue
 
 The original PPO input encoded sticker colors as normalized numeric IDs:
