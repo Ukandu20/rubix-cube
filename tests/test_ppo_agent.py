@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+from collections import deque
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,6 +31,7 @@ from agents.ppo_agent import (  # noqa: E402
     save_checkpoint,
     select_action,
     _evaluation_selection_mode,
+    _episode_window_metrics,
 )
 from cube.gym_environment import SOLVED_STATE_STRING, decode_state, encode_state
 from cube.moves import apply_move
@@ -51,6 +53,37 @@ class RecordingPolicy:
 
 
 class PPOAgentTests(unittest.TestCase):
+    def test_empty_episode_window_metrics_include_behavior_rates(self):
+        metrics = _episode_window_metrics(deque())
+
+        self.assertEqual(metrics["timeout_rate"], 0.0)
+        self.assertEqual(metrics["inverse_move_rate"], 0.0)
+
+    def test_episode_window_metrics_calculate_behavior_rates(self):
+        episodes = deque(
+            [
+                {
+                    "reward": 1.0,
+                    "length": 2,
+                    "solved": True,
+                    "timeout": False,
+                    "inverse_moves": 1,
+                },
+                {
+                    "reward": -1.0,
+                    "length": 4,
+                    "solved": False,
+                    "timeout": True,
+                    "inverse_moves": 2,
+                },
+            ]
+        )
+
+        metrics = _episode_window_metrics(episodes)
+
+        self.assertEqual(metrics["timeout_rate"], 0.5)
+        self.assertEqual(metrics["inverse_move_rate"], 0.5)
+
     def test_network_forward_shapes(self):
         model = ActorCriticNet(NetworkConfig(hidden_layers=(32, 16)))
         observations = torch.zeros((4, ONE_HOT_OBSERVATION_SIZE), dtype=torch.float32)

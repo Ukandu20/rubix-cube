@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import random
 from collections import deque
@@ -697,14 +698,18 @@ def train_ppo(
     }
     if output_metadata:
         run_config.update(dict(output_metadata))
-    metrics = {
-        "history": history,
+    persisted_metrics = {
         "final_evaluation": final_evaluation,
         "random_baseline": random_baseline,
         "best_solve_rate": best_solve_rate,
     }
+    metrics = {
+        "history": history,
+        **persisted_metrics,
+    }
     _write_json(output_path / "config.json", run_config)
-    _write_json(output_path / "metrics.json", metrics)
+    write_history_csv(output_path / "history.csv", history)
+    _write_json(output_path / "metrics.json", persisted_metrics)
     return {
         "model": model,
         "config": run_config,
@@ -1138,11 +1143,20 @@ def _episode_window_metrics(episodes: deque[dict[str, Any]]) -> dict[str, float]
             "mean_episode_reward": 0.0,
             "mean_episode_length": 0.0,
             "train_solve_rate": 0.0,
+            "timeout_rate": 0.0,
+            "inverse_move_rate": 0.0,
         }
+    total_steps = sum(int(row["length"]) for row in episodes)
     return {
         "mean_episode_reward": mean(float(row["reward"]) for row in episodes),
         "mean_episode_length": mean(int(row["length"]) for row in episodes),
         "train_solve_rate": mean(float(row["solved"]) for row in episodes),
+        "timeout_rate": mean(float(row["timeout"]) for row in episodes),
+        "inverse_move_rate": (
+            sum(int(row["inverse_moves"]) for row in episodes) / total_steps
+            if total_steps
+            else 0.0
+        ),
     }
 
 
@@ -1172,3 +1186,52 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def write_history_csv(
+    path: Path | str,
+    history: list[Mapping[str, Any]],
+) -> None:
+    """Write PPO update history as CSV, encoding nested values as JSON."""
+
+    rows = list(history)
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise TypeError(f"history row {index} must be a mapping")
+
+    fieldnames: list[str] = []
+    seen_fields: set[str] = set()
+    for row in rows:
+        for fieldname in row:
+            if not isinstance(fieldname, str):
+                raise TypeError("history field names must be strings")
+            if fieldname not in seen_fields:
+                seen_fields.add(fieldname)
+                fieldnames.append(fieldname)
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if fieldnames:
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(
+                        {
+                            key: _history_csv_value(row.get(key))
+                            for key in fieldnames
+                        }
+                    )
+        temporary.replace(destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _history_csv_value(value: Any) -> Any:
+    if isinstance(value, (Mapping, list, tuple)):
+        return json.dumps(value, separators=(",", ":"), sort_keys=True)
+    return value
