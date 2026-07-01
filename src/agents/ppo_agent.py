@@ -19,6 +19,7 @@ from torch.distributions import Categorical
 from agents.behavior_logging import BehaviorLogger, utc_timestamp
 from cube.environment import ACTION_TO_MOVE
 from cube.gym_environment import (
+    DEFAULT_EXHAUSTIVE_STATE_THRESHOLD,
     DEFAULT_MAX_EPISODE_STEPS,
     DEFAULT_TRAINING_DATA_DIR,
     RubixCubeSolveEnv,
@@ -30,10 +31,13 @@ DEFAULT_OUTPUT_DIR = Path("models/artifacts/ppo")
 DEFAULT_TOTAL_TIMESTEPS = 500_000
 DEFAULT_EVAL_FREQUENCY = 10_000
 DEFAULT_EVAL_EPISODES = 100
+EXHAUSTIVE_STATE_THRESHOLD = DEFAULT_EXHAUSTIVE_STATE_THRESHOLD
+EXHAUSTIVE_EVAL_STATE_THRESHOLD = EXHAUSTIVE_STATE_THRESHOLD
 OBSERVATION_SIZE = 54
 COLOR_COUNT = 6
 ONE_HOT_OBSERVATION_SIZE = OBSERVATION_SIZE * COLOR_COUNT
 ACTION_SIZE = 12
+CHECKPOINT_VERSION = 2
 ObservationEncoding = Literal["one_hot", "normalized"]
 
 
@@ -42,7 +46,7 @@ class PPOConfig:
     """Hyperparameters for the custom PPO trainer."""
 
     learning_rate: float = 3e-4
-    gamma: float = 0.99
+    gamma: float = 0.95
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     n_epochs: int = 10
@@ -70,27 +74,54 @@ class NetworkConfig:
 
 
 class ActorCriticNet(nn.Module):
-    """Shared MLP feature extractor with separate actor and critic heads."""
+    """Independent actor and critic MLPs."""
 
     def __init__(self, config: NetworkConfig | None = None) -> None:
         super().__init__()
         self.config = config or NetworkConfig()
-        layers: list[nn.Module] = []
-        previous_dim = self.config.input_dim
-        for hidden_dim in self.config.hidden_layers:
-            layers.append(nn.Linear(previous_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            previous_dim = hidden_dim
-
-        self.shared = nn.Sequential(*layers)
-        self.actor = nn.Linear(previous_dim, self.config.actor_output_dim)
-        self.critic = nn.Linear(previous_dim, self.config.critic_output_dim)
+        self.actor = _build_mlp(
+            input_dim=self.config.input_dim,
+            hidden_layers=self.config.hidden_layers,
+            output_dim=self.config.actor_output_dim,
+        )
+        self.critic = _build_mlp(
+            input_dim=self.config.input_dim,
+            hidden_layers=self.config.hidden_layers,
+            output_dim=self.config.critic_output_dim,
+        )
 
     def forward(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        features = self.shared(observations)
-        logits = self.actor(features)
-        values = self.critic(features).squeeze(-1)
+        logits = self.actor(observations)
+        values = self.critic(observations).squeeze(-1)
         return logits, values
+
+    def actor_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return actor parameters for branch-specific optimization controls."""
+
+        return tuple(self.actor.parameters())
+
+    def critic_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return critic parameters for branch-specific optimization controls."""
+
+        return tuple(self.critic.parameters())
+
+
+def _build_mlp(
+    *,
+    input_dim: int,
+    hidden_layers: tuple[int, ...],
+    output_dim: int,
+) -> nn.Sequential:
+    """Build one actor or critic MLP."""
+
+    layers: list[nn.Module] = []
+    previous_dim = input_dim
+    for hidden_dim in hidden_layers:
+        layers.append(nn.Linear(previous_dim, hidden_dim))
+        layers.append(nn.ReLU())
+        previous_dim = hidden_dim
+    layers.append(nn.Linear(previous_dim, output_dim))
+    return nn.Sequential(*layers)
 
 
 class RolloutBuffer:
@@ -243,6 +274,7 @@ def make_training_env(
         scramble_depth_range=depth_range,
         max_episode_steps=max_episode_steps,
         validate_dataset=validate_dataset,
+        exhaustive_state_threshold=EXHAUSTIVE_STATE_THRESHOLD,
     )
 
 
@@ -261,6 +293,7 @@ def make_eval_env(
         scramble_depth_range=None,
         max_episode_steps=max_episode_steps,
         validate_dataset=validate_dataset,
+        exhaustive_state_threshold=EXHAUSTIVE_STATE_THRESHOLD,
     )
 
 
@@ -483,7 +516,14 @@ def ppo_update(
 
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            nn.utils.clip_grad_norm_(
+                model.actor_parameters(),
+                config.max_grad_norm,
+            )
+            nn.utils.clip_grad_norm_(
+                model.critic_parameters(),
+                config.max_grad_norm,
+            )
             optimizer.step()
 
             with torch.no_grad():
@@ -527,6 +567,7 @@ def train_ppo(
     eval_episodes: int = DEFAULT_EVAL_EPISODES,
     config: PPOConfig | None = None,
     network_config: NetworkConfig | None = None,
+    output_metadata: Mapping[str, Any] | None = None,
     validate_dataset: bool = True,
 ) -> dict[str, Any]:
     """Train a custom PPO agent and save final/best checkpoints."""
@@ -550,7 +591,7 @@ def train_ppo(
         validate_dataset=validate_dataset,
     )
     env.action_space.seed(seed)
-    observation, info = env.reset(seed=seed)
+    observation, info = env.reset(seed=None)
 
     model = ActorCriticNet(network_config).to(run_device)
     optimizer = torch.optim.Adam(model.parameters(), lr=ppo_config.learning_rate)
@@ -604,7 +645,6 @@ def train_ppo(
                 episodes_per_depth=eval_episodes,
                 max_episode_steps=max_episode_steps,
                 data_dir=data_dir,
-                seed=seed + total_steps,
                 device=run_device,
                 validate_dataset=validate_dataset,
             )
@@ -631,7 +671,6 @@ def train_ppo(
         episodes_per_depth=eval_episodes,
         max_episode_steps=max_episode_steps,
         data_dir=data_dir,
-        seed=seed + total_steps + 1,
         device=run_device,
         validate_dataset=validate_dataset,
     )
@@ -646,6 +685,7 @@ def train_ppo(
     run_config = {
         "total_timesteps": total_timesteps,
         "actual_timesteps": total_steps,
+        "output_dir": str(output_path),
         "min_depth": min_depth,
         "max_depth": max_depth,
         "max_episode_steps": max_episode_steps,
@@ -655,6 +695,8 @@ def train_ppo(
         "ppo": asdict(ppo_config),
         "network": _network_config_dict(network_config or NetworkConfig()),
     }
+    if output_metadata:
+        run_config.update(dict(output_metadata))
     metrics = {
         "history": history,
         "final_evaluation": final_evaluation,
@@ -678,7 +720,6 @@ def evaluate_ppo_model(
     episodes_per_depth: int = DEFAULT_EVAL_EPISODES,
     max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
     data_dir: Path | str = DEFAULT_TRAINING_DATA_DIR,
-    seed: int = 0,
     device: torch.device | str | None = None,
     validate_dataset: bool = True,
     behavior_logger: BehaviorLogger | None = None,
@@ -691,7 +732,7 @@ def evaluate_ppo_model(
         episodes_per_depth=episodes_per_depth,
         max_episode_steps=max_episode_steps,
         data_dir=data_dir,
-        seed=seed,
+        seed=None,
         device=device,
         random_policy=False,
         validate_dataset=validate_dataset,
@@ -737,6 +778,7 @@ def save_checkpoint(
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
+            "checkpoint_version": CHECKPOINT_VERSION,
             "model_state_dict": model.state_dict(),
             "ppo_config": asdict(config),
             "network_config": _network_config_dict(network_config),
@@ -758,9 +800,40 @@ def load_checkpoint(
     checkpoint = torch.load(Path(path), map_location=run_device)
     network_config = _network_config_from_dict(checkpoint.get("network_config", {}))
     model = ActorCriticNet(network_config).to(run_device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    state_dict = checkpoint["model_state_dict"]
+    if int(checkpoint.get("checkpoint_version", 1)) < CHECKPOINT_VERSION:
+        state_dict = _migrate_legacy_shared_state_dict(
+            state_dict,
+            network_config=network_config,
+        )
+    model.load_state_dict(state_dict)
     model.eval()
     return model, checkpoint
+
+
+def _migrate_legacy_shared_state_dict(
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    network_config: NetworkConfig,
+) -> dict[str, torch.Tensor]:
+    """Convert a shared-trunk checkpoint into independent actor/critic towers."""
+
+    output_layer_index = 2 * len(network_config.hidden_layers)
+    migrated: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if key.startswith("shared."):
+            suffix = key.removeprefix("shared.")
+            migrated[f"actor.{suffix}"] = value
+            migrated[f"critic.{suffix}"] = value
+        elif key.startswith("actor."):
+            suffix = key.removeprefix("actor.")
+            migrated[f"actor.{output_layer_index}.{suffix}"] = value
+        elif key.startswith("critic."):
+            suffix = key.removeprefix("critic.")
+            migrated[f"critic.{output_layer_index}.{suffix}"] = value
+        else:
+            migrated[key] = value
+    return migrated
 
 
 def explained_variance(predictions: np.ndarray, targets: np.ndarray) -> float:
@@ -779,7 +852,7 @@ def _evaluate_policy(
     episodes_per_depth: int,
     max_episode_steps: int,
     data_dir: Path | str,
-    seed: int,
+    seed: int | None,
     random_policy: bool,
     validate_dataset: bool,
     behavior_logger: BehaviorLogger | None,
@@ -797,11 +870,34 @@ def _evaluate_policy(
             data_dir=data_dir,
             validate_dataset=validate_dataset,
         )
-        env.action_space.seed(seed + int(depth))
+        if seed is not None:
+            env.action_space.seed(seed + int(depth))
+        available_states = len(env.states_by_depth[int(depth)])
+        selection_mode = env.state_selection_mode(int(depth))
+        exhaustive_deterministic_evaluation = (
+            not random_policy and selection_mode == "exhaustive_cycle"
+        )
+        evaluation_episodes = (
+            min(episodes_per_depth, available_states)
+            if exhaustive_deterministic_evaluation
+            else episodes_per_depth
+        )
         depth_rows: list[dict[str, Any]] = []
-        for episode in range(episodes_per_depth):
-            episode_seed = seed + int(depth) * 10_000 + episode
-            observation, reset_info = env.reset(seed=episode_seed)
+        for episode in range(evaluation_episodes):
+            episode_seed = (
+                None
+                if seed is None
+                else seed + int(depth) * 10_000 + episode
+            )
+            reset_options = (
+                {"state_index": episode}
+                if exhaustive_deterministic_evaluation
+                else None
+            )
+            observation, reset_info = env.reset(
+                seed=episode_seed,
+                options=reset_options,
+            )
             done = False
             episode_reward = 0.0
             inverse_moves = 0
@@ -870,6 +966,7 @@ def _evaluate_policy(
                     "solution_length": steps if solved else None,
                     "inverse_moves": inverse_moves,
                     "extra_moves": steps - int(depth) if solved else None,
+                    "moves_taken": moves_taken,
                 }
             )
             if behavior_logger is not None:
@@ -893,7 +990,14 @@ def _evaluate_policy(
                     },
                 )
 
-        by_depth[str(depth)] = _evaluation_metrics(depth_rows)
+        depth_metrics = _evaluation_metrics(depth_rows)
+        depth_metrics.update(
+            {
+                "available_states": available_states,
+                "state_selection": selection_mode,
+            }
+        )
+        by_depth[str(depth)] = depth_metrics
         aggregate.extend(depth_rows)
 
     return {
@@ -901,6 +1005,16 @@ def _evaluate_policy(
         "by_depth": by_depth,
         "overall": _evaluation_metrics(aggregate),
     }
+
+
+def _evaluation_selection_mode(available_states: int) -> str:
+    """Return the state-selection strategy for an evaluation dataset."""
+
+    return (
+        "exhaustive_cycle"
+        if available_states < EXHAUSTIVE_STATE_THRESHOLD
+        else "random"
+    )
 
 
 def _policy_action(
@@ -977,6 +1091,7 @@ def _evaluation_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if row["extra_moves"] is not None
     ]
     total_steps = sum(int(row["steps"]) for row in rows)
+    action_counts = _action_counts(rows)
     return {
         "episodes": len(rows),
         "solved_count": len(solved_rows),
@@ -993,6 +1108,27 @@ def _evaluation_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             else 0.0
         ),
         "average_extra_moves": mean(extra_moves) if extra_moves else None,
+        "action_counts": action_counts,
+        "action_distribution": _action_distribution(action_counts),
+    }
+
+
+def _action_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {ACTION_TO_MOVE[action_id]: 0 for action_id in sorted(ACTION_TO_MOVE)}
+    for row in rows:
+        for move in row.get("moves_taken", []):
+            if move in counts:
+                counts[move] += 1
+    return counts
+
+
+def _action_distribution(action_counts: Mapping[str, int]) -> dict[str, float]:
+    total = sum(int(count) for count in action_counts.values())
+    if total == 0:
+        return {move: 0.0 for move in action_counts}
+    return {
+        move: int(count) / total
+        for move, count in action_counts.items()
     }
 
 

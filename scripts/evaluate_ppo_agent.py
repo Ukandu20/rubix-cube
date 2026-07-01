@@ -36,9 +36,16 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_TRAINING_DATA_DIR)
     parser.add_argument("--min-depth", type=int, default=1)
     parser.add_argument("--max-depth", type=int, default=5)
-    parser.add_argument("--episodes", type=int, default=DEFAULT_EVAL_EPISODES)
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=DEFAULT_EVAL_EPISODES,
+        help=(
+            "Maximum episodes per depth; small exhaustive datasets are "
+            "evaluated once per unique state."
+        ),
+    )
     parser.add_argument("--max-episode-steps", type=int, default=DEFAULT_MAX_EPISODE_STEPS)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None)
     parser.add_argument("--json", type=Path, default=None)
     parser.add_argument("--log-behavior", action="store_true")
@@ -71,7 +78,6 @@ def main() -> None:
         episodes_per_depth=args.episodes,
         max_episode_steps=args.max_episode_steps,
         data_dir=args.data_dir,
-        seed=args.seed,
         device=args.device,
         validate_dataset=not args.skip_dataset_validation,
         behavior_logger=behavior_logger,

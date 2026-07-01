@@ -2,6 +2,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agents.behavior_logging import BehaviorLogConfig, BehaviorLogger
 from agents.ppo_agent import (  # noqa: E402
     ActorCriticNet,
+    EXHAUSTIVE_EVAL_STATE_THRESHOLD,
     NetworkConfig,
     OBSERVATION_SIZE,
     ONE_HOT_OBSERVATION_SIZE,
@@ -21,13 +23,15 @@ from agents.ppo_agent import (  # noqa: E402
     evaluate_ppo_model,
     evaluate_random_baseline,
     load_checkpoint,
+    make_training_env,
     ppo_update,
     predict_action,
     preprocess_observations,
     save_checkpoint,
     select_action,
+    _evaluation_selection_mode,
 )
-from cube.gym_environment import SOLVED_STATE_STRING, decode_state
+from cube.gym_environment import SOLVED_STATE_STRING, decode_state, encode_state
 from cube.moves import apply_move
 from cube.state import CubeState
 
@@ -35,6 +39,15 @@ from cube.state import CubeState
 class AlwaysRPrimePolicy:
     def predict(self, observation, deterministic=True):
         return 3, None
+
+
+class RecordingPolicy:
+    def __init__(self):
+        self.start_states = []
+
+    def predict(self, observation, deterministic=True):
+        self.start_states.append(encode_state(observation))
+        return 0, None
 
 
 class PPOAgentTests(unittest.TestCase):
@@ -61,6 +74,35 @@ class PPOAgentTests(unittest.TestCase):
 
         self.assertEqual(tuple(logits.shape), (4, 12))
         self.assertEqual(tuple(values.shape), (4,))
+
+    def test_actor_and_critic_have_independent_parameters_and_gradients(self):
+        model = ActorCriticNet(NetworkConfig(hidden_layers=(16,)))
+        observations = torch.zeros((4, ONE_HOT_OBSERVATION_SIZE))
+        actor_parameter_ids = {id(parameter) for parameter in model.actor_parameters()}
+        critic_parameter_ids = {id(parameter) for parameter in model.critic_parameters()}
+
+        self.assertTrue(actor_parameter_ids)
+        self.assertTrue(critic_parameter_ids)
+        self.assertTrue(actor_parameter_ids.isdisjoint(critic_parameter_ids))
+
+        logits, _ = model(observations)
+        logits.sum().backward()
+        self.assertTrue(
+            all(parameter.grad is not None for parameter in model.actor_parameters())
+        )
+        self.assertTrue(
+            all(parameter.grad is None for parameter in model.critic_parameters())
+        )
+
+        model.zero_grad()
+        _, values = model(observations)
+        values.sum().backward()
+        self.assertTrue(
+            all(parameter.grad is None for parameter in model.actor_parameters())
+        )
+        self.assertTrue(
+            all(parameter.grad is not None for parameter in model.critic_parameters())
+        )
 
     def test_action_selection_and_prediction_return_valid_actions(self):
         model = ActorCriticNet(NetworkConfig(hidden_layers=(32,)))
@@ -156,13 +198,14 @@ class PPOAgentTests(unittest.TestCase):
         )
         before = [parameter.detach().clone() for parameter in model.parameters()]
 
-        metrics = ppo_update(
-            model=model,
-            optimizer=optimizer,
-            buffer=buffer,
-            config=PPOConfig(n_epochs=2, batch_size=2),
-            device=torch.device("cpu"),
-        )
+        with patch("agents.ppo_agent.nn.utils.clip_grad_norm_") as clip_grad_norm:
+            metrics = ppo_update(
+                model=model,
+                optimizer=optimizer,
+                buffer=buffer,
+                config=PPOConfig(n_epochs=2, batch_size=2, target_kl=None),
+                device=torch.device("cpu"),
+            )
 
         changed = any(
             not torch.allclose(previous, current)
@@ -171,6 +214,17 @@ class PPOAgentTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertIn("policy_loss", metrics)
         self.assertIn("explained_variance", metrics)
+        self.assertEqual(clip_grad_norm.call_count, 8)
+        actor_parameter_ids = {id(parameter) for parameter in model.actor_parameters()}
+        critic_parameter_ids = {id(parameter) for parameter in model.critic_parameters()}
+        for call_index, call in enumerate(clip_grad_norm.call_args_list):
+            clipped_parameter_ids = {id(parameter) for parameter in call.args[0]}
+            expected_ids = (
+                actor_parameter_ids
+                if call_index % 2 == 0
+                else critic_parameter_ids
+            )
+            self.assertEqual(clipped_parameter_ids, expected_ids)
 
     def test_deterministic_evaluation_reports_per_depth_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -186,9 +240,146 @@ class PPOAgentTests(unittest.TestCase):
                 data_dir=data_dir,
             )
 
-        self.assertEqual(results["by_depth"]["1"]["episodes"], 2)
+        self.assertEqual(results["episodes_per_depth"], 2)
+        self.assertEqual(results["by_depth"]["1"]["episodes"], 1)
         self.assertEqual(results["by_depth"]["1"]["solve_rate"], 1.0)
-        self.assertEqual(results["overall"]["solved_count"], 2)
+        self.assertEqual(results["overall"]["solved_count"], 1)
+        self.assertEqual(results["by_depth"]["1"]["action_counts"]["R'"], 1)
+        self.assertEqual(results["by_depth"]["1"]["action_distribution"]["R'"], 1.0)
+        self.assertEqual(results["by_depth"]["1"]["available_states"], 1)
+        self.assertEqual(
+            results["by_depth"]["1"]["state_selection"],
+            "exhaustive_cycle",
+        )
+
+    def test_small_evaluation_dataset_evaluates_each_state_once_in_row_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            rows = [
+                _row_for_moves("R"),
+                _row_for_moves("L"),
+                _row_for_moves("F"),
+            ]
+            _write_depth_csv(data_dir, 1, rows)
+            policy = RecordingPolicy()
+
+            results = evaluate_ppo_model(
+                policy,
+                depths=(1,),
+                episodes_per_depth=8,
+                max_episode_steps=1,
+                data_dir=data_dir,
+            )
+
+        expected_cycle = [row["state_encoded"] for row in rows]
+        self.assertEqual(policy.start_states, expected_cycle)
+        self.assertEqual(results["episodes_per_depth"], 8)
+        self.assertEqual(results["by_depth"]["1"]["episodes"], 3)
+        self.assertEqual(results["by_depth"]["1"]["available_states"], 3)
+        self.assertEqual(
+            results["by_depth"]["1"]["state_selection"],
+            "exhaustive_cycle",
+        )
+
+    def test_small_evaluation_respects_requested_count_below_available_states(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            rows = [
+                _row_for_moves("R"),
+                _row_for_moves("L"),
+                _row_for_moves("F"),
+            ]
+            _write_depth_csv(data_dir, 1, rows)
+            policy = RecordingPolicy()
+
+            results = evaluate_ppo_model(
+                policy,
+                depths=(1,),
+                episodes_per_depth=2,
+                max_episode_steps=1,
+                data_dir=data_dir,
+            )
+
+        self.assertEqual(
+            policy.start_states,
+            [row["state_encoded"] for row in rows[:2]],
+        )
+        self.assertEqual(results["episodes_per_depth"], 2)
+        self.assertEqual(results["by_depth"]["1"]["episodes"], 2)
+
+    def test_evaluation_selection_threshold_is_strict(self):
+        self.assertEqual(
+            _evaluation_selection_mode(EXHAUSTIVE_EVAL_STATE_THRESHOLD - 1),
+            "exhaustive_cycle",
+        )
+        self.assertEqual(
+            _evaluation_selection_mode(EXHAUSTIVE_EVAL_STATE_THRESHOLD),
+            "random",
+        )
+
+    def test_small_training_dataset_cycles_evenly_in_row_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            rows = [
+                _row_for_moves("R"),
+                _row_for_moves("L"),
+                _row_for_moves("F"),
+            ]
+            _write_depth_csv(data_dir, 1, rows)
+            env = make_training_env(
+                min_depth=1,
+                max_depth=1,
+                data_dir=data_dir,
+            )
+
+            selected_states = [encode_state(env.reset()[0]) for _ in range(8)]
+
+        expected_cycle = [row["state_encoded"] for row in rows]
+        self.assertEqual(selected_states, (expected_cycle * 3)[:8])
+
+    def test_training_cycles_are_independent_per_depth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            depth_1_rows = [
+                _row_for_moves("R"),
+                _row_for_moves("L"),
+            ]
+            depth_2_rows = [
+                _row_for_moves("U R", depth=2),
+                _row_for_moves("D F", depth=2),
+            ]
+            _write_depth_csv(data_dir, 1, depth_1_rows)
+            _write_depth_csv(data_dir, 2, depth_2_rows)
+            env = make_training_env(
+                min_depth=1,
+                max_depth=2,
+                data_dir=data_dir,
+            )
+
+            selections = {
+                depth: [
+                    encode_state(env.reset(options={"scramble_depth": depth})[0])
+                    for _ in range(3)
+                ]
+                for depth in (1, 2)
+            }
+
+        self.assertEqual(
+            selections[1],
+            [
+                depth_1_rows[0]["state_encoded"],
+                depth_1_rows[1]["state_encoded"],
+                depth_1_rows[0]["state_encoded"],
+            ],
+        )
+        self.assertEqual(
+            selections[2],
+            [
+                depth_2_rows[0]["state_encoded"],
+                depth_2_rows[1]["state_encoded"],
+                depth_2_rows[0]["state_encoded"],
+            ],
+        )
 
     def test_random_baseline_reports_expected_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -197,15 +388,29 @@ class PPOAgentTests(unittest.TestCase):
 
             results = evaluate_random_baseline(
                 depths=(1,),
-                episodes_per_depth=1,
+                episodes_per_depth=3,
+                max_episode_steps=2,
+                data_dir=data_dir,
+                seed=3,
+            )
+            repeated_results = evaluate_random_baseline(
+                depths=(1,),
+                episodes_per_depth=3,
                 max_episode_steps=2,
                 data_dir=data_dir,
                 seed=3,
             )
 
         self.assertIn("1", results["by_depth"])
+        self.assertEqual(results, repeated_results)
+        self.assertEqual(results["by_depth"]["1"]["episodes"], 3)
         self.assertIn("solve_rate", results["overall"])
         self.assertIn("inverse_move_rate", results["overall"])
+        self.assertIn("action_distribution", results["overall"])
+        self.assertAlmostEqual(
+            sum(results["overall"]["action_distribution"].values()),
+            1.0,
+        )
 
     def test_behavior_logging_writes_episode_and_step_parquet(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -278,6 +483,7 @@ class PPOAgentTests(unittest.TestCase):
             }.issubset(steps.columns)
         )
         self.assertEqual(episodes.loc[0, "model_version"], "ppo_test")
+        self.assertTrue(pd.isna(episodes.loc[0, "seed"]))
         self.assertEqual(episodes.loc[0, "moves_taken"], steps.loc[0, "move"])
         self.assertEqual(int(episodes.loc[0, "moves_taken_count"]), 1)
         self.assertEqual(len(steps.loc[0, "start_state"]), 54)
@@ -302,6 +508,7 @@ class PPOAgentTests(unittest.TestCase):
 
         self.assertEqual(loaded_model.config.input_dim, ONE_HOT_OBSERVATION_SIZE)
         self.assertEqual(loaded_model.config.observation_encoding, "one_hot")
+        self.assertEqual(checkpoint["checkpoint_version"], 2)
         self.assertEqual(checkpoint["network_config"]["observation_encoding"], "one_hot")
 
     def test_old_normalized_checkpoint_without_encoding_loads(self):
@@ -312,6 +519,7 @@ class PPOAgentTests(unittest.TestCase):
                 observation_encoding="normalized",
             )
         )
+        _make_actor_and_critic_hidden_layers_identical(model)
         old_network_config = {
             "input_dim": OBSERVATION_SIZE,
             "hidden_layers": [16],
@@ -323,7 +531,7 @@ class PPOAgentTests(unittest.TestCase):
             path = Path(directory) / "old_model.pt"
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": _legacy_shared_state_dict(model),
                     "ppo_config": {},
                     "network_config": old_network_config,
                     "metadata": {},
@@ -335,6 +543,68 @@ class PPOAgentTests(unittest.TestCase):
 
         self.assertEqual(loaded_model.config.input_dim, OBSERVATION_SIZE)
         self.assertEqual(loaded_model.config.observation_encoding, "normalized")
+
+    def test_legacy_shared_checkpoint_migration_preserves_predictions(self):
+        torch.manual_seed(7)
+        model = ActorCriticNet(NetworkConfig(hidden_layers=(16, 8)))
+        _make_actor_and_critic_hidden_layers_identical(model)
+        observations = torch.randn((4, ONE_HOT_OBSERVATION_SIZE))
+        model.eval()
+        with torch.no_grad():
+            expected_logits, expected_values = model(observations)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy_model.pt"
+            torch.save(
+                {
+                    "model_state_dict": _legacy_shared_state_dict(model),
+                    "ppo_config": {},
+                    "network_config": {
+                        **model.config.__dict__,
+                        "hidden_layers": list(model.config.hidden_layers),
+                    },
+                    "metadata": {},
+                },
+                path,
+            )
+
+            loaded_model, checkpoint = load_checkpoint(path)
+            with torch.no_grad():
+                actual_logits, actual_values = loaded_model(observations)
+
+        self.assertNotIn("checkpoint_version", checkpoint)
+        self.assertTrue(torch.equal(actual_logits, expected_logits))
+        self.assertTrue(torch.equal(actual_values, expected_values))
+
+
+def _make_actor_and_critic_hidden_layers_identical(model: ActorCriticNet) -> None:
+    output_layer_index = 2 * len(model.config.hidden_layers)
+    with torch.no_grad():
+        for layer_index in range(0, output_layer_index, 2):
+            model.critic[layer_index].load_state_dict(
+                model.actor[layer_index].state_dict()
+            )
+
+
+def _legacy_shared_state_dict(
+    model: ActorCriticNet,
+) -> dict[str, torch.Tensor]:
+    output_layer_index = 2 * len(model.config.hidden_layers)
+    legacy: dict[str, torch.Tensor] = {}
+    for key, value in model.state_dict().items():
+        if key.startswith("actor."):
+            suffix = key.removeprefix("actor.")
+            layer_index, parameter_name = suffix.split(".", maxsplit=1)
+            if int(layer_index) == output_layer_index:
+                legacy[f"actor.{parameter_name}"] = value
+            else:
+                legacy[f"shared.{suffix}"] = value
+        elif key.startswith(f"critic.{output_layer_index}."):
+            parameter_name = key.removeprefix(
+                f"critic.{output_layer_index}."
+            )
+            legacy[f"critic.{parameter_name}"] = value
+    return legacy
 
 
 def _row_for_moves(moves: str, depth: int | None = None) -> dict:
