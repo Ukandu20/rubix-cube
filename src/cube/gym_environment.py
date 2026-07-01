@@ -25,6 +25,7 @@ ENV_ID = "RubixCubeSolve-v0"
 SOLVED_STATE_STRING = "YYYYYYYYYOOOOOOOOOGGGGGGGGGWWWWWWWWWRRRRRRRRRBBBBBBBBB"
 STICKER_COUNT = 54
 DEFAULT_MAX_EPISODE_STEPS = 50
+DEFAULT_EXHAUSTIVE_STATE_THRESHOLD = 500
 DEFAULT_TRAINING_DATA_DIR = Path("data/processed/training/parquet")
 DEFAULT_STATE_FILES = {
     depth: DEFAULT_TRAINING_DATA_DIR / f"depth_{depth}.parquet"
@@ -54,10 +55,10 @@ INVERSE_ACTION = {
     11: 10,
 }
 DEFAULT_REWARD_CONFIG = {
-    "move_penalty": -1.0,
-    "solve_bonus": 100.0,
-    "inverse_move_penalty": -5.0,
-    "timeout_penalty": -10.0,
+    "move_penalty": -0.01,
+    "solve_bonus": 1.0,
+    "inverse_move_penalty": -0.05,
+    "timeout_penalty": -0.1,
 }
 OPTIONAL_INFO_COLUMNS = (
     "sample_id",
@@ -83,11 +84,17 @@ class RubixCubeSolveEnv(gym.Env):
         reward_config: Mapping[str, float] | None = None,
         render_mode: str | None = None,
         validate_dataset: bool = True,
+        exhaustive_state_threshold: int | None = None,
     ) -> None:
         if max_episode_steps <= 0:
             raise ValueError("max_episode_steps must be positive")
         if render_mode not in (None, "text", "human"):
             raise ValueError("render_mode must be one of None, 'text', or 'human'")
+        if (
+            exhaustive_state_threshold is not None
+            and exhaustive_state_threshold <= 0
+        ):
+            raise ValueError("exhaustive_state_threshold must be positive")
 
         configured_state_files = (
             state_files
@@ -105,6 +112,7 @@ class RubixCubeSolveEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.state_column = state_column
         self.render_mode = render_mode
+        self.exhaustive_state_threshold = exhaustive_state_threshold
         self.reward_config = {
             **DEFAULT_REWARD_CONFIG,
             **dict(reward_config or {}),
@@ -125,6 +133,9 @@ class RubixCubeSolveEnv(gym.Env):
 
         self.states_by_depth = self._load_state_files(validate_dataset)
         self._validate_depth_configuration()
+        self._next_state_index_by_depth = {
+            depth: 0 for depth in self.states_by_depth
+        }
 
         self.cube = CubeState.solved()
         self.cube_state = self.solved_state.copy()
@@ -152,7 +163,15 @@ class RubixCubeSolveEnv(gym.Env):
         self.episode_return = 0.0
         self.current_depth = self._select_depth(options)
 
-        row = self.sample_state_from_depth(self.current_depth)
+        state_index = None
+        if options and "state_index" in options:
+            state_index = int(options["state_index"])
+        elif self.state_selection_mode(self.current_depth) == "exhaustive_cycle":
+            state_index = self._next_state_index_by_depth[self.current_depth]
+            self._next_state_index_by_depth[self.current_depth] = (
+                state_index + 1
+            ) % len(self.states_by_depth[self.current_depth])
+        row = self.sample_state_from_depth(self.current_depth, state_index=state_index)
         encoded_state = str(row[self.state_column]).strip()
         self.cube = CubeState.from_flat_string(encoded_state, 3)
         self.cube_state = decode_state(encoded_state)
@@ -225,8 +244,13 @@ class RubixCubeSolveEnv(gym.Env):
         }
         return self.get_observation(), reward, terminated, truncated, info
 
-    def sample_state_from_depth(self, depth: int) -> pd.Series:
-        """Return one randomly selected dataset row for a depth."""
+    def sample_state_from_depth(
+        self,
+        depth: int,
+        *,
+        state_index: int | None = None,
+    ) -> pd.Series:
+        """Return one selected dataset row for a depth."""
 
         if depth not in self.states_by_depth:
             raise ValueError(f"No precomputed states available for depth {depth}.")
@@ -235,8 +259,31 @@ class RubixCubeSolveEnv(gym.Env):
         if frame.empty:
             raise ValueError(f"Depth {depth} file contains no states.")
 
+        if state_index is not None:
+            if state_index < 0 or state_index >= len(frame):
+                raise ValueError(
+                    f"state_index must be between 0 and {len(frame) - 1} "
+                    f"for depth {depth}"
+                )
+            return frame.iloc[state_index]
+
         random_index = int(self.np_random.integers(0, len(frame)))
         return frame.iloc[random_index]
+
+    def state_selection_mode(self, depth: int) -> str:
+        """Return the configured state-selection strategy for a depth."""
+
+        if depth not in self.states_by_depth:
+            raise ValueError(f"No precomputed states available for depth {depth}.")
+        available_states = len(self.states_by_depth[depth])
+        return (
+            "exhaustive_cycle"
+            if (
+                self.exhaustive_state_threshold is not None
+                and available_states < self.exhaustive_state_threshold
+            )
+            else "random"
+        )
 
     def calculate_reward(self, solved: bool, immediate_inverse: bool) -> float:
         """Calculate reward before any timeout penalty is added."""

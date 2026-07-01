@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import cube  # noqa: E402,F401
 from cube.environment import MOVE_TO_ACTION
 from cube.gym_environment import (
+    DEFAULT_EXHAUSTIVE_STATE_THRESHOLD,
     ENV_ID,
     INVERSE_ACTION,
     SOLVED_STATE_STRING,
@@ -45,6 +46,66 @@ class RubixCubeSolveEnvTests(unittest.TestCase):
             self.assertEqual(info["solution_moves"], "R'")
             self.assertFalse(info["is_solved"])
 
+    def test_reset_can_select_an_exact_state_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [_row_for_move("R"), _row_for_move("L")]
+            path = _write_depth_csv(directory, 1, rows)
+            env = RubixCubeSolveEnv(state_files={1: path})
+
+            observation, info = env.reset(options={"state_index": 1})
+
+            self.assertEqual(info["sample_id"], "sample_L")
+            self.assertEqual(encode_state(observation), rows[1]["state_encoded"])
+
+    def test_reset_rejects_out_of_range_state_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_depth_csv(directory, 1, [_row_for_move("R")])
+            env = RubixCubeSolveEnv(state_files={1: path})
+
+            for state_index in (-1, 1):
+                with self.subTest(state_index=state_index):
+                    with self.assertRaisesRegex(ValueError, "state_index"):
+                        env.reset(options={"state_index": state_index})
+
+    def test_explicit_state_index_overrides_exhaustive_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [_row_for_move("R"), _row_for_move("L")]
+            path = _write_depth_csv(directory, 1, rows)
+            env = RubixCubeSolveEnv(
+                state_files={1: path},
+                exhaustive_state_threshold=DEFAULT_EXHAUSTIVE_STATE_THRESHOLD,
+            )
+
+            _, explicit_info = env.reset(options={"state_index": 1})
+            _, automatic_info = env.reset()
+
+            self.assertEqual(explicit_info["sample_id"], "sample_L")
+            self.assertEqual(automatic_info["sample_id"], "sample_R")
+
+    def test_exhaustive_selection_threshold_is_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            small_path = _write_depth_csv(
+                directory,
+                1,
+                [_row_for_move("R")] * (DEFAULT_EXHAUSTIVE_STATE_THRESHOLD - 1),
+            )
+            threshold_path = _write_depth_csv(
+                directory,
+                2,
+                [_row_for_move("U R", depth=2)]
+                * DEFAULT_EXHAUSTIVE_STATE_THRESHOLD,
+            )
+            env = RubixCubeSolveEnv(
+                state_files={1: small_path, 2: threshold_path},
+                scramble_depth=None,
+                scramble_depth_range=(1, 2),
+                validate_dataset=False,
+                exhaustive_state_threshold=DEFAULT_EXHAUSTIVE_STATE_THRESHOLD,
+            )
+
+            self.assertEqual(env.state_selection_mode(1), "exhaustive_cycle")
+            self.assertEqual(env.state_selection_mode(2), "random")
+
     def test_step_returns_five_values_and_ordinary_reward(self):
         with tempfile.TemporaryDirectory() as directory:
             path = _write_depth_csv(directory, 1, [_row_for_move("R")])
@@ -56,7 +117,7 @@ class RubixCubeSolveEnvTests(unittest.TestCase):
             )
 
             self.assertTrue(env.observation_space.contains(observation))
-            self.assertEqual(reward, -1.0)
+            self.assertAlmostEqual(reward, -0.01)
             self.assertFalse(terminated)
             self.assertFalse(truncated)
             self.assertEqual(info["last_move"], "U")
@@ -74,7 +135,7 @@ class RubixCubeSolveEnvTests(unittest.TestCase):
             )
 
             self.assertEqual(encode_state(observation), SOLVED_STATE_STRING)
-            self.assertEqual(reward, 99.0)
+            self.assertAlmostEqual(reward, 0.99)
             self.assertTrue(terminated)
             self.assertFalse(truncated)
             self.assertTrue(info["is_solved"])
@@ -89,7 +150,7 @@ class RubixCubeSolveEnvTests(unittest.TestCase):
             env.step(MOVE_TO_ACTION["U"])
             _, reward, terminated, truncated, info = env.step(MOVE_TO_ACTION["U'"])
 
-            self.assertEqual(reward, -6.0)
+            self.assertAlmostEqual(reward, -0.06)
             self.assertFalse(terminated)
             self.assertFalse(truncated)
             self.assertTrue(info["immediate_inverse_move"])
@@ -102,7 +163,7 @@ class RubixCubeSolveEnvTests(unittest.TestCase):
 
             _, reward, terminated, truncated, info = env.step(MOVE_TO_ACTION["U"])
 
-            self.assertEqual(reward, -11.0)
+            self.assertAlmostEqual(reward, -0.11)
             self.assertFalse(terminated)
             self.assertTrue(truncated)
             self.assertEqual(info["terminated_reason"], "max_steps_reached")
@@ -167,7 +228,7 @@ class RubixCubeSolveEnvTests(unittest.TestCase):
             rendered = env.render()
 
             self.assertIsInstance(rendered, str)
-            self.assertIn("Step: 0 / 50", rendered)
+            self.assertIn(f"Step: 0 / {env.max_episode_steps}", rendered)
             self.assertIn("Face 0:", rendered)
             self.assertIn("Solved: False", rendered)
 
