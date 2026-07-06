@@ -1,0 +1,75 @@
+curriculum:
+  min_depth: 1
+  max_depth: 7
+  starting_depth: 1
+  sampling_strategy: mixed
+
+  max_steps_multiplier: 2
+  max_steps_offset: 1
+
+  advancement_thresholds:
+    1:
+      success_rate: 0.90
+      max_average_moves: 2
+      max_timeout_rate: 0.10
+    2:
+      success_rate: 0.85
+      max_average_moves: 4
+      max_timeout_rate: 0.10
+    3:
+      success_rate: 0.80
+      max_average_moves: 6
+      max_timeout_rate: 0.15
+    4:
+      success_rate: 0.75
+      max_average_moves: 8
+      max_timeout_rate: 0.15
+    5:
+      success_rate: 0.75
+      max_average_moves: 10
+      max_timeout_rate: 0.20
+    6:
+      success_rate: 0.70
+      max_average_moves: 12
+      max_timeout_rate: 0.20
+    7:
+      success_rate: 0.70
+      max_average_moves: 14
+      max_timeout_rate: 0.25
+
+  mixed_sampling_weights:
+    1:
+      1: 1.00
+    2:
+      1: 0.30
+      2: 0.70
+    3:
+      1: 0.20
+      2: 0.30
+      3: 0.50
+    4:
+      1: 0.10
+      2: 0.20
+      3: 0.30
+      4: 0.40
+    5:
+      1: 0.10
+      2: 0.15
+      3: 0.20
+      4: 0.25
+      5: 0.30
+    6:
+      1: 0.05
+      2: 0.10
+      3: 0.10
+      4: 0.15
+      5: 0.20
+      6: 0.40
+    7:
+      1: 0.05
+      2: 0.05
+      3: 0.10
+      4: 0.10
+      5: 0.10
+      6: 0.20
+      7: 0.40

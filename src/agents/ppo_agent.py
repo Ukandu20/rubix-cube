@@ -26,6 +26,7 @@ from cube.gym_environment import (
     RubixCubeSolveEnv,
     encode_state,
 )
+from curriculum.manager import CurriculumConfig, CurriculumManager
 
 
 DEFAULT_OUTPUT_DIR = Path("models/artifacts/ppo")
@@ -260,14 +261,31 @@ def state_files_for_depths(
 def make_training_env(
     *,
     min_depth: int = 1,
-    max_depth: int = 5,
+    max_depth: int = 8,
     max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
     data_dir: Path | str = DEFAULT_TRAINING_DATA_DIR,
     validate_dataset: bool = True,
+    curriculum_config: CurriculumConfig | None = None,
+    curriculum_manager: CurriculumManager | None = None,
+    seed: int | None = None,
 ) -> RubixCubeSolveEnv:
-    """Create a dataset-driven training environment with uniform depth sampling."""
+    """Create a dataset-driven uniform or curriculum training environment."""
 
+    if curriculum_manager is None and curriculum_config is not None:
+        curriculum_manager = CurriculumManager(
+            state_files_for_depths(
+                curriculum_config.min_depth,
+                curriculum_config.max_depth,
+                data_dir,
+            ),
+            curriculum_config,
+            exhaustive_state_threshold=EXHAUSTIVE_STATE_THRESHOLD,
+            validate_dataset=validate_dataset,
+            seed=seed,
+        )
     state_files = state_files_for_depths(min_depth, max_depth, data_dir)
+    if curriculum_manager is not None:
+        state_files = curriculum_manager.depth_files
     depth_range = (min_depth, max_depth) if min_depth != max_depth else None
     return RubixCubeSolveEnv(
         state_files=state_files,
@@ -276,6 +294,7 @@ def make_training_env(
         max_episode_steps=max_episode_steps,
         validate_dataset=validate_dataset,
         exhaustive_state_threshold=EXHAUSTIVE_STATE_THRESHOLD,
+        curriculum_manager=curriculum_manager,
     )
 
 
@@ -558,7 +577,7 @@ def train_ppo(
     *,
     total_timesteps: int = DEFAULT_TOTAL_TIMESTEPS,
     min_depth: int = 1,
-    max_depth: int = 5,
+    max_depth: int = 10,
     max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
     data_dir: Path | str = DEFAULT_TRAINING_DATA_DIR,
     output_dir: Path | str = DEFAULT_OUTPUT_DIR,
@@ -570,6 +589,8 @@ def train_ppo(
     network_config: NetworkConfig | None = None,
     output_metadata: Mapping[str, Any] | None = None,
     validate_dataset: bool = True,
+    curriculum_config: CurriculumConfig | None = None,
+    curriculum_manager: CurriculumManager | None = None,
 ) -> dict[str, Any]:
     """Train a custom PPO agent and save final/best checkpoints."""
 
@@ -584,12 +605,33 @@ def train_ppo(
     run_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     set_random_seeds(seed)
 
+    if curriculum_manager is None and curriculum_config is not None:
+        curriculum_manager = CurriculumManager(
+            state_files_for_depths(
+                curriculum_config.min_depth,
+                curriculum_config.max_depth,
+                data_dir,
+            ),
+            curriculum_config,
+            exhaustive_state_threshold=EXHAUSTIVE_STATE_THRESHOLD,
+            validate_dataset=validate_dataset,
+            seed=seed,
+        )
+    if curriculum_manager is not None:
+        curriculum_config = curriculum_manager.config
+        training_min_depth = curriculum_config.min_depth
+        training_max_depth = curriculum_config.max_depth
+    else:
+        training_min_depth = min_depth
+        training_max_depth = max_depth
+
     env = make_training_env(
-        min_depth=min_depth,
-        max_depth=max_depth,
+        min_depth=training_min_depth,
+        max_depth=training_max_depth,
         max_episode_steps=max_episode_steps,
         data_dir=data_dir,
         validate_dataset=validate_dataset,
+        curriculum_manager=curriculum_manager,
     )
     env.action_space.seed(seed)
     observation, info = env.reset(seed=None)
@@ -604,9 +646,10 @@ def train_ppo(
     total_steps = 0
     next_eval_step = eval_frequency
     recent_episodes: deque[dict[str, Any]] = deque(maxlen=100)
+    curriculum_evaluations: list[dict[str, Any]] = []
 
     random_baseline = evaluate_random_baseline(
-        depths=range(min_depth, max_depth + 1),
+        depths=range(training_min_depth, training_max_depth + 1),
         episodes_per_depth=max(1, min(eval_episodes, 20)),
         max_episode_steps=max_episode_steps,
         data_dir=data_dir,
@@ -638,27 +681,96 @@ def train_ppo(
             "timesteps": total_steps,
             **update_metrics,
         }
+        if curriculum_manager is not None:
+            row.update(
+                {
+                    "curriculum_depth": curriculum_manager.get_current_depth(),
+                    "curriculum_sampling_weights": (
+                        curriculum_manager.current_weights()
+                    ),
+                }
+            )
 
         if total_steps >= next_eval_step or total_steps >= total_timesteps:
+            evaluation_depths: range | tuple[int, ...]
+            evaluation_max_steps = max_episode_steps
+            evaluated_curriculum_depth = None
+            if curriculum_manager is not None and curriculum_config is not None:
+                evaluated_curriculum_depth = (
+                    curriculum_manager.get_current_depth()
+                )
+                evaluation_depths = (evaluated_curriculum_depth,)
+                evaluation_max_steps = curriculum_config.max_episode_steps(
+                    evaluated_curriculum_depth
+                )
+            else:
+                evaluation_depths = range(
+                    training_min_depth,
+                    training_max_depth + 1,
+                )
             evaluation = evaluate_ppo_model(
                 model,
-                depths=range(min_depth, max_depth + 1),
+                depths=evaluation_depths,
                 episodes_per_depth=eval_episodes,
-                max_episode_steps=max_episode_steps,
+                max_episode_steps=evaluation_max_steps,
                 data_dir=data_dir,
                 device=run_device,
                 validate_dataset=validate_dataset,
             )
             row["evaluation"] = evaluation
+            advanced_curriculum = False
+            if (
+                curriculum_manager is not None
+                and curriculum_config is not None
+                and evaluated_curriculum_depth is not None
+            ):
+                depth_metrics = evaluation["by_depth"][
+                    str(evaluated_curriculum_depth)
+                ]
+                threshold = curriculum_config.advancement_thresholds[
+                    evaluated_curriculum_depth
+                ]
+                if curriculum_manager.should_advance(depth_metrics):
+                    advanced_curriculum = curriculum_manager.increase_depth(
+                        timestep=total_steps,
+                        metrics=depth_metrics,
+                    )
+                curriculum_evaluation = {
+                    "timesteps": total_steps,
+                    "curriculum_depth": evaluated_curriculum_depth,
+                    "metrics": depth_metrics,
+                    "threshold": asdict(threshold),
+                    "advanced_curriculum": advanced_curriculum,
+                    "next_curriculum_depth": (
+                        curriculum_manager.get_current_depth()
+                    ),
+                }
+                curriculum_evaluations.append(curriculum_evaluation)
+                row["curriculum_evaluation"] = curriculum_evaluation
+                _write_json(
+                    output_path / "curriculum_progress.json",
+                    {
+                        **curriculum_manager.progress(),
+                        "evaluations": curriculum_evaluations,
+                    },
+                )
             solve_rate = float(evaluation["overall"]["solve_rate"])
             if solve_rate > best_solve_rate:
                 best_solve_rate = solve_rate
+                checkpoint_metadata = {
+                    "timesteps": total_steps,
+                    "evaluation": evaluation,
+                }
+                if curriculum_manager is not None:
+                    checkpoint_metadata["curriculum"] = (
+                        curriculum_manager.progress()
+                    )
                 save_checkpoint(
                     output_path / "best_model.pt",
                     model=model,
                     config=ppo_config,
                     network_config=network_config or NetworkConfig(),
-                    metadata={"timesteps": total_steps, "evaluation": evaluation},
+                    metadata=checkpoint_metadata,
                 )
             while next_eval_step <= total_steps:
                 next_eval_step += eval_frequency
@@ -666,35 +778,54 @@ def train_ppo(
         history.append(row)
         print(json.dumps(row, sort_keys=True))
 
+    final_depths: range | tuple[int, ...] = range(
+        training_min_depth,
+        training_max_depth + 1,
+    )
+    final_max_episode_steps = max_episode_steps
+    if curriculum_manager is not None and curriculum_config is not None:
+        final_depth = curriculum_manager.get_current_depth()
+        final_depths = (final_depth,)
+        final_max_episode_steps = curriculum_config.max_episode_steps(final_depth)
     final_evaluation = evaluate_ppo_model(
         model,
-        depths=range(min_depth, max_depth + 1),
+        depths=final_depths,
         episodes_per_depth=eval_episodes,
-        max_episode_steps=max_episode_steps,
+        max_episode_steps=final_max_episode_steps,
         data_dir=data_dir,
         device=run_device,
         validate_dataset=validate_dataset,
     )
+    final_checkpoint_metadata = {
+        "timesteps": total_steps,
+        "evaluation": final_evaluation,
+    }
+    if curriculum_manager is not None:
+        final_checkpoint_metadata["curriculum"] = curriculum_manager.progress()
     save_checkpoint(
         output_path / "final_model.pt",
         model=model,
         config=ppo_config,
         network_config=network_config or NetworkConfig(),
-        metadata={"timesteps": total_steps, "evaluation": final_evaluation},
+        metadata=final_checkpoint_metadata,
     )
-
     run_config = {
         "total_timesteps": total_timesteps,
         "actual_timesteps": total_steps,
         "output_dir": str(output_path),
-        "min_depth": min_depth,
-        "max_depth": max_depth,
+        "min_depth": training_min_depth,
+        "max_depth": training_max_depth,
         "max_episode_steps": max_episode_steps,
         "data_dir": str(data_dir),
         "seed": seed,
         "device": str(run_device),
         "ppo": asdict(ppo_config),
         "network": _network_config_dict(network_config or NetworkConfig()),
+        "curriculum": (
+            curriculum_config.to_dict()
+            if curriculum_config is not None
+            else None
+        ),
     }
     if output_metadata:
         run_config.update(dict(output_metadata))
@@ -702,6 +833,14 @@ def train_ppo(
         "final_evaluation": final_evaluation,
         "random_baseline": random_baseline,
         "best_solve_rate": best_solve_rate,
+        "curriculum_progress": (
+            {
+                **curriculum_manager.progress(),
+                "evaluations": curriculum_evaluations,
+            }
+            if curriculum_manager is not None
+            else None
+        ),
     }
     metrics = {
         "history": history,

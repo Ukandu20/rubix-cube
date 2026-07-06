@@ -29,6 +29,10 @@ from cube.gym_environment import (  # noqa: E402
     DEFAULT_MAX_EPISODE_STEPS,
     DEFAULT_TRAINING_DATA_DIR,
 )
+from curriculum.manager import (  # noqa: E402
+    DEFAULT_CURRICULUM_CONFIG_PATH,
+    load_curriculum_config,
+)
 
 
 def main() -> None:
@@ -76,6 +80,17 @@ def main() -> None:
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--target-kl", type=float, default=0.03)
     parser.add_argument(
+        "--curriculum-config",
+        type=Path,
+        default=DEFAULT_CURRICULUM_CONFIG_PATH,
+        help="YAML curriculum configuration used for mixed-depth training.",
+    )
+    parser.add_argument(
+        "--no-curriculum",
+        action="store_true",
+        help="Disable curriculum learning and use legacy uniform depth sampling.",
+    )
+    parser.add_argument(
         "--skip-dataset-validation",
         action="store_true",
         help="Skip expensive dataset validation when using trusted generated files.",
@@ -103,19 +118,34 @@ def main() -> None:
         ),
         observation_encoding=args.observation_encoding,
     )
+    curriculum_config = (
+        None
+        if args.no_curriculum
+        else load_curriculum_config(args.curriculum_config)
+    )
+    training_min_depth = (
+        curriculum_config.min_depth
+        if curriculum_config is not None
+        else args.min_depth
+    )
+    training_max_depth = (
+        curriculum_config.max_depth
+        if curriculum_config is not None
+        else args.max_depth
+    )
     output_dir, output_metadata = resolve_training_output_dir(
         output_dir=args.output_dir,
         output_root=args.output_root,
-        min_depth=args.min_depth,
-        max_depth=args.max_depth,
+        min_depth=training_min_depth,
+        max_depth=training_max_depth,
         observation_encoding=args.observation_encoding,
         version=args.version,
         overwrite=args.overwrite,
     )
     result = train_ppo(
         total_timesteps=args.total_timesteps,
-        min_depth=args.min_depth,
-        max_depth=args.max_depth,
+        min_depth=training_min_depth,
+        max_depth=training_max_depth,
         max_episode_steps=args.max_episode_steps,
         data_dir=args.data_dir,
         output_dir=output_dir,
@@ -127,6 +157,7 @@ def main() -> None:
         network_config=network_config,
         output_metadata=output_metadata,
         validate_dataset=not args.skip_dataset_validation,
+        curriculum_config=curriculum_config,
     )
     print(f"Saved PPO artifacts to {result['output_dir']}")
 

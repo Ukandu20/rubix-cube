@@ -25,7 +25,7 @@ ENV_ID = "RubixCubeSolve-v0"
 SOLVED_STATE_STRING = "YYYYYYYYYOOOOOOOOOGGGGGGGGGWWWWWWWWWRRRRRRRRRBBBBBBBBB"
 STICKER_COUNT = 54
 DEFAULT_MAX_EPISODE_STEPS = 50
-DEFAULT_EXHAUSTIVE_STATE_THRESHOLD = 500
+DEFAULT_EXHAUSTIVE_STATE_THRESHOLD = 10000
 DEFAULT_TRAINING_DATA_DIR = Path("data/processed/training/parquet")
 DEFAULT_STATE_FILES = {
     depth: DEFAULT_TRAINING_DATA_DIR / f"depth_{depth}.parquet"
@@ -85,6 +85,7 @@ class RubixCubeSolveEnv(gym.Env):
         render_mode: str | None = None,
         validate_dataset: bool = True,
         exhaustive_state_threshold: int | None = None,
+        curriculum_manager: Any | None = None,
     ) -> None:
         if max_episode_steps <= 0:
             raise ValueError("max_episode_steps must be positive")
@@ -96,11 +97,14 @@ class RubixCubeSolveEnv(gym.Env):
         ):
             raise ValueError("exhaustive_state_threshold must be positive")
 
-        configured_state_files = (
-            state_files
-            if state_files is not None
-            else _default_state_files_for(scramble_depth, scramble_depth_range)
-        )
+        configured_state_files = state_files
+        if configured_state_files is None and curriculum_manager is not None:
+            configured_state_files = curriculum_manager.depth_files
+        if configured_state_files is None:
+            configured_state_files = _default_state_files_for(
+                scramble_depth,
+                scramble_depth_range,
+            )
         self.state_files = {
             int(depth): Path(path) for depth, path in configured_state_files.items()
         }
@@ -109,7 +113,9 @@ class RubixCubeSolveEnv(gym.Env):
 
         self.scramble_depth = scramble_depth
         self.scramble_depth_range = scramble_depth_range
+        self.curriculum_manager = curriculum_manager
         self.max_episode_steps = max_episode_steps
+        self.episode_max_steps = max_episode_steps
         self.state_column = state_column
         self.render_mode = render_mode
         self.exhaustive_state_threshold = exhaustive_state_threshold
@@ -131,7 +137,11 @@ class RubixCubeSolveEnv(gym.Env):
         self.action_space = spaces.Discrete(len(ACTION_TO_MOVE))
         self.solved_state = decode_state(SOLVED_STATE_STRING)
 
-        self.states_by_depth = self._load_state_files(validate_dataset)
+        self.states_by_depth = (
+            curriculum_manager.depth_data
+            if curriculum_manager is not None
+            else self._load_state_files(validate_dataset)
+        )
         self._validate_depth_configuration()
         self._next_state_index_by_depth = {
             depth: 0 for depth in self.states_by_depth
@@ -156,32 +166,65 @@ class RubixCubeSolveEnv(gym.Env):
         """Start a new episode from one precomputed cube state."""
 
         super().reset(seed=seed)
+        if self.curriculum_manager is not None and seed is not None:
+            self.curriculum_manager.seed(seed)
         self.current_step = 0
         self.move_history = []
         self.last_action = None
         self.last_move = None
         self.episode_return = 0.0
-        self.current_depth = self._select_depth(options)
-
-        state_index = None
-        if options and "state_index" in options:
-            state_index = int(options["state_index"])
-        elif self.state_selection_mode(self.current_depth) == "exhaustive_cycle":
-            state_index = self._next_state_index_by_depth[self.current_depth]
-            self._next_state_index_by_depth[self.current_depth] = (
-                state_index + 1
-            ) % len(self.states_by_depth[self.current_depth])
-        row = self.sample_state_from_depth(self.current_depth, state_index=state_index)
+        curriculum_depth = None
+        if self.curriculum_manager is not None:
+            curriculum_depth = self.curriculum_manager.get_current_depth()
+            requested_depth = (
+                int(options["scramble_depth"])
+                if options and "scramble_depth" in options
+                else None
+            )
+            state_index = (
+                int(options["state_index"])
+                if options and "state_index" in options
+                else None
+            )
+            self.current_depth, row = self.curriculum_manager.sample_state(
+                depth=requested_depth,
+                state_index=state_index,
+            )
+            self.episode_max_steps = (
+                self.curriculum_manager.config.max_episode_steps(curriculum_depth)
+            )
+        else:
+            self.current_depth = self._select_depth(options)
+            self.episode_max_steps = self.max_episode_steps
+            state_index = None
+            if options and "state_index" in options:
+                state_index = int(options["state_index"])
+            elif self.state_selection_mode(self.current_depth) == "exhaustive_cycle":
+                state_index = self._next_state_index_by_depth[self.current_depth]
+                self._next_state_index_by_depth[self.current_depth] = (
+                    state_index + 1
+                ) % len(self.states_by_depth[self.current_depth])
+            row = self.sample_state_from_depth(
+                self.current_depth,
+                state_index=state_index,
+            )
         encoded_state = str(row[self.state_column]).strip()
         self.cube = CubeState.from_flat_string(encoded_state, 3)
         self.cube_state = decode_state(encoded_state)
-        self.episode_start_info = self._row_metadata(row)
+        self.episode_start_info = {
+            **self._row_metadata(row),
+            "sampled_depth": self.current_depth,
+            "curriculum_depth": curriculum_depth,
+        }
 
         info = {
             "state_source": "precomputed",
             "start_depth": self.current_depth,
+            "sampled_depth": self.current_depth,
+            "curriculum_depth": curriculum_depth,
             "encoded_state": encoded_state,
             "current_step": self.current_step,
+            "max_episode_steps": self.episode_max_steps,
             "is_solved": self.is_solved(),
             **self.episode_start_info,
         }
@@ -212,7 +255,7 @@ class RubixCubeSolveEnv(gym.Env):
             immediate_inverse=immediate_inverse,
         )
         terminated = solved
-        truncated = self.current_step >= self.max_episode_steps and not solved
+        truncated = self.current_step >= self.episode_max_steps and not solved
         if truncated:
             reward += self.timeout_penalty
 
@@ -223,8 +266,9 @@ class RubixCubeSolveEnv(gym.Env):
         info = {
             "is_solved": solved,
             "start_depth": self.current_depth,
+            "sampled_depth": self.current_depth,
             "current_step": self.current_step,
-            "max_episode_steps": self.max_episode_steps,
+            "max_episode_steps": self.episode_max_steps,
             "last_action": action,
             "last_move": move,
             "immediate_inverse_move": immediate_inverse,
@@ -273,6 +317,8 @@ class RubixCubeSolveEnv(gym.Env):
     def state_selection_mode(self, depth: int) -> str:
         """Return the configured state-selection strategy for a depth."""
 
+        if self.curriculum_manager is not None:
+            return self.curriculum_manager.state_selection_mode(depth)
         if depth not in self.states_by_depth:
             raise ValueError(f"No precomputed states available for depth {depth}.")
         available_states = len(self.states_by_depth[depth])
@@ -304,6 +350,20 @@ class RubixCubeSolveEnv(gym.Env):
         """Return a defensive copy of the current observation."""
 
         return self.cube_state.copy()
+
+    def set_curriculum_depth(self, depth: int) -> None:
+        """Set the active curriculum level."""
+
+        if self.curriculum_manager is None:
+            raise RuntimeError("No curriculum manager is configured")
+        self.curriculum_manager.set_depth(depth)
+
+    def get_current_depth(self) -> int:
+        """Return the active curriculum level or current sampled depth."""
+
+        if self.curriculum_manager is not None:
+            return self.curriculum_manager.get_current_depth()
+        return self.current_depth
 
     def render(self) -> str | None:
         """Render the cube as text, printing it for human mode."""
@@ -386,6 +446,8 @@ class RubixCubeSolveEnv(gym.Env):
         seen_states.update(states)
 
     def _validate_depth_configuration(self) -> None:
+        if self.curriculum_manager is not None:
+            return
         if self.scramble_depth_range is not None:
             min_depth, max_depth = self.scramble_depth_range
             if min_depth > max_depth:
@@ -418,7 +480,7 @@ class RubixCubeSolveEnv(gym.Env):
     def _render_text(self) -> str:
         encoded_state = encode_state(self.cube_state)
         lines = [
-            f"Step: {self.current_step} / {self.max_episode_steps}",
+            f"Step: {self.current_step} / {self.episode_max_steps}",
             f"Start depth: {self.current_depth}",
             f"Last move: {self.last_move}",
             f"Solved: {self.is_solved()}",
