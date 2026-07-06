@@ -160,6 +160,8 @@ def main() -> None:
         curriculum_config=curriculum_config,
     )
     print(f"Saved PPO artifacts to {result['output_dir']}")
+    elapsed_seconds = result["metrics"]["training_session"]["elapsed_seconds"]
+    print(f"Training runtime: {elapsed_seconds:.2f} seconds")
 
 
 def resolve_training_output_dir(

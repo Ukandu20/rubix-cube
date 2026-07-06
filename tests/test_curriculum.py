@@ -208,6 +208,16 @@ class CurriculumManagerTests(unittest.TestCase):
             )
 
         self.assertEqual(run_config["curriculum"]["sampling_strategy"], "mixed")
+        self.assertEqual(
+            run_config["training_session"],
+            metrics["training_session"],
+        )
+        self.assertTrue(run_config["training_session"]["started_at"])
+        self.assertTrue(run_config["training_session"]["completed_at"])
+        self.assertGreaterEqual(
+            run_config["training_session"]["elapsed_seconds"],
+            0.0,
+        )
         self.assertEqual(progress["current_depth"], 1)
         self.assertEqual(len(progress["evaluations"]), 1)
         self.assertIn("curriculum_progress", metrics)

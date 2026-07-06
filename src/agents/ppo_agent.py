@@ -9,6 +9,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean, median
+from time import perf_counter
 from typing import Any, Literal, Mapping, Optional
 
 import numpy as np
@@ -601,6 +602,8 @@ def train_ppo(
     if eval_episodes <= 0:
         raise ValueError("eval_episodes must be positive")
 
+    training_started_at = utc_timestamp()
+    training_start_time = perf_counter()
     ppo_config = config or PPOConfig()
     run_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     set_random_seeds(seed)
@@ -809,6 +812,11 @@ def train_ppo(
         network_config=network_config or NetworkConfig(),
         metadata=final_checkpoint_metadata,
     )
+    training_session = {
+        "started_at": training_started_at,
+        "completed_at": utc_timestamp(),
+        "elapsed_seconds": perf_counter() - training_start_time,
+    }
     run_config = {
         "total_timesteps": total_timesteps,
         "actual_timesteps": total_steps,
@@ -826,10 +834,12 @@ def train_ppo(
             if curriculum_config is not None
             else None
         ),
+        "training_session": training_session,
     }
     if output_metadata:
         run_config.update(dict(output_metadata))
     persisted_metrics = {
+        "training_session": training_session,
         "final_evaluation": final_evaluation,
         "random_baseline": random_baseline,
         "best_solve_rate": best_solve_rate,
