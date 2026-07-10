@@ -43,3 +43,38 @@ python -m pip install -r requirements.txt
 3. Store generated datasets in `data/processed`.
 4. Save trained models and related outputs under `models`.
 5. Put generated charts and report assets in `reports/figures`.
+
+## Streamlit model showcase
+
+The local showcase generates seeded scramble sequences with lengths 1–10,
+animates PPO solve attempts, and runs per-length benchmarks without loading the
+large processed training datasets.
+
+```powershell
+python -m streamlit run streamlit_app.py
+```
+
+The app discovers trusted local checkpoints under `models/artifacts/ppo`.
+Artifacts remain gitignored and must exist on the machine running the app.
+Checkpoint curriculum metadata is displayed in the sidebar; scramble lengths
+beyond the checkpoint's evaluated depths are marked as experimental.
+
+The app reports **scramble length**, not guaranteed optimal distance. A generated
+sequence can occasionally produce a state whose shortest solution is shorter
+than the sequence itself.
+
+The solve demo:
+
+- supports exact, uniform-range, and curriculum-weighted sampling;
+- runs a greedy attempt first and reproducible stochastic retries afterward;
+- enforces move, attempt, and cooperative wall-clock limits;
+- separates model inference and solver runtime from animation time; and
+- keeps downloadable run history only in the current Streamlit session.
+
+The benchmark compares greedy and retry-assisted PPO solve rates with the known
+inverse-scramble oracle. Its summary and detailed results can be downloaded as
+CSV files.
+
+Use `python -m streamlit` rather than the global `streamlit` command so the app
+runs with the same Python interpreter where the project dependencies, including
+PyTorch, were installed.
