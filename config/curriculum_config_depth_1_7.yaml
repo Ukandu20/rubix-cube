@@ -4,7 +4,7 @@ curriculum:
   starting_depth: 1
   sampling_strategy: mixed
 
-  max_steps_multiplier: 2
+  max_steps_multiplier: 3
   max_steps_offset: 1
 
   advancement_thresholds:

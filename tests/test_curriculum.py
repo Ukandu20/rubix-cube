@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -10,7 +11,12 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from agents.ppo_agent import NetworkConfig, PPOConfig, train_ppo  # noqa: E402
+from agents.ppo_agent import (  # noqa: E402
+    NetworkConfig,
+    PPOConfig,
+    load_checkpoint,
+    train_ppo,
+)
 from cube.gym_environment import RubixCubeSolveEnv  # noqa: E402
 from cube.moves import apply_move  # noqa: E402
 from cube.state import CubeState  # noqa: E402
@@ -206,6 +212,14 @@ class CurriculumManagerTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            best_checkpoint = load_checkpoint(
+                output_dir / "best_model.pt",
+                device="cpu",
+            )[1]
+            depth_checkpoint = load_checkpoint(
+                output_dir / "best_model_depth_1.pt",
+                device="cpu",
+            )[1]
 
         self.assertEqual(run_config["curriculum"]["sampling_strategy"], "mixed")
         self.assertEqual(
@@ -222,11 +236,59 @@ class CurriculumManagerTests(unittest.TestCase):
         self.assertEqual(len(progress["evaluations"]), 1)
         self.assertIn("curriculum_progress", metrics)
         self.assertEqual(
+            metrics["checkpoint_selection"]["strategy"],
+            "curriculum_lexicographic",
+        )
+        self.assertEqual(
+            metrics["checkpoint_selection"]["best_curriculum_depth"],
+            1,
+        )
+        self.assertEqual(
+            best_checkpoint["metadata"]["selection"],
+            "curriculum_lexicographic",
+        )
+        self.assertEqual(
+            depth_checkpoint["metadata"]["selection"],
+            "best_at_curriculum_depth",
+        )
+        self.assertEqual(
             result["metrics"]["history"][0]["curriculum_evaluation"][
                 "curriculum_depth"
             ],
             1,
         )
+
+    def test_training_saves_latest_passed_curriculum_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_dir = root / "data"
+            output_dir = root / "output"
+            _write_depth_csv(data_dir, 1, [_row_for_moves("R")])
+            _write_depth_csv(data_dir, 2, [_row_for_moves("U R")])
+
+            with patch.object(
+                CurriculumManager,
+                "should_advance",
+                return_value=True,
+            ):
+                train_ppo(
+                    total_timesteps=2,
+                    data_dir=data_dir,
+                    output_dir=output_dir,
+                    eval_frequency=2,
+                    eval_episodes=1,
+                    config=PPOConfig(n_steps=2, n_epochs=1, batch_size=2),
+                    network_config=NetworkConfig(hidden_layers=(8,)),
+                    curriculum_config=_config(max_depth=2),
+                )
+
+            metadata = load_checkpoint(
+                output_dir / "latest_passed_gate.pt",
+                device="cpu",
+            )[1]["metadata"]
+
+        self.assertEqual(metadata["selection"], "latest_passed_curriculum_gate")
+        self.assertEqual(metadata["passed_curriculum_depth"], 1)
 
 
 def _config(

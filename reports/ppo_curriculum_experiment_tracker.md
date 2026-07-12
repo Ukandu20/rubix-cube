@@ -6,6 +6,15 @@ Purpose: track controlled PPO curriculum-learning experiments for the depth-1–
 
 ## Current bottleneck summary
 
+Experiment 001 (`v005`) cleared the previous depth-6 bottleneck and advanced to
+depth 7. The current bottleneck is depth-7 reliability: deterministic solve rate
+remains around 34-39%, successful solutions are efficient, and most failures
+run until timeout. The depth-7 solve rate plateaued for approximately 1.93
+million training timesteps, so more training with the same configuration is not
+the preferred next experiment.
+
+## Pre-v005 bottleneck hypothesis
+
 The recent depth-1–10 PPO runs reached the harder curriculum stages but stalled around depth 6.
 
 Observed issue:
@@ -49,7 +58,7 @@ Baseline notes from `v004`:
 
 ## Experiment 001: More depth-6+ exposure with longer training
 
-Status: planned
+Status: completed
 
 ### Hypothesis
 
@@ -189,32 +198,55 @@ After training:
 
 ### Result log
 
-Fill this in after the experiment completes.
-
 ```text
-Run artifact:
-Started:
-Completed:
-Configured timesteps:
-Actual timesteps:
-Final curriculum depth:
-Best checkpoint:
-Final checkpoint:
+Run artifact: models/artifacts/ppo/depth_1_10_onehot/v005
+Started: 2026-07-09T20:08:19Z
+Completed: 2026-07-10T02:23:01Z
+Configured timesteps: 5,000,000
+Actual timesteps: 5,001,216
+Final curriculum depth: 7
+Best checkpoint: best_model.pt (selected at depth 1; invalid for hard-depth comparison)
+Final checkpoint: final_model.pt
 
-Depth-6 best solve_rate:
-Depth-6 best timeout_rate:
-Depth-6 best average_solution_length:
+Depth-6 best solve_rate: 0.703
+Depth-6 best timeout_rate: 0.297
+Depth-6 best average_solution_length: 6.174
 
-Depth-6 final solve_rate:
-Depth-6 final timeout_rate:
-Depth-6 final average_solution_length:
+Depth-6 final solve_rate before advancement: 0.703
+Depth-6 final timeout_rate before advancement: 0.297
+Depth-6 final average_solution_length before advancement: 6.174
 
-Advanced past depth 6:
-If yes, timestep of advancement:
+Advanced past depth 6: yes
+If yes, timestep of advancement: 3,072,000
 
-Streamlit benchmark summary:
-Notes:
+Depth-7 best curriculum solve_rate: 0.390
+Depth-7 final curriculum solve_rate: 0.385
+Depth-7 final standalone solve_rate: 0.394
+Depth-7 final standalone timeout_rate: 0.606
+Depth-7 final average solution length: 7.294
+
+Streamlit benchmark summary: not recorded
+Notes: Experiment 001 succeeded at depth 6, then plateaued at depth 7.
 ```
+
+## Implemented: curriculum-aware checkpoint selection
+
+Checkpoint selection now ranks curriculum evaluations lexicographically by:
+
+1. Highest curriculum depth.
+2. Highest solve rate at that depth.
+3. Lowest timeout rate when solve rates tie.
+
+New training runs produce:
+
+- `best_model.pt`: best checkpoint under the curriculum-aware ranking.
+- `best_model_depth_<n>.pt`: best checkpoint observed at each evaluated depth.
+- `latest_passed_gate.pt`: most recent checkpoint that passed a curriculum gate.
+- `final_model.pt`: unchanged final training checkpoint.
+
+`metrics.json` records the selection strategy and best metrics observed at each
+depth. Existing `v005` artifacts predate this implementation and are not
+retroactively renamed; its `best_model.pt` remains the depth-1 checkpoint.
 
 ## Decision criteria
 

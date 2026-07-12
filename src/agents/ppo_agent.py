@@ -646,6 +646,9 @@ def train_ppo(
 
     history: list[dict[str, Any]] = []
     best_solve_rate = -1.0
+    best_curriculum_depth = 0
+    best_timeout_rate = float("inf")
+    best_by_depth: dict[int, dict[str, float | int]] = {}
     total_steps = 0
     next_eval_step = eval_frequency
     recent_episodes: deque[dict[str, Any]] = deque(maxlen=100)
@@ -758,16 +761,92 @@ def train_ppo(
                     },
                 )
             solve_rate = float(evaluation["overall"]["solve_rate"])
-            if solve_rate > best_solve_rate:
-                best_solve_rate = solve_rate
-                checkpoint_metadata = {
-                    "timesteps": total_steps,
-                    "evaluation": evaluation,
-                }
-                if curriculum_manager is not None:
-                    checkpoint_metadata["curriculum"] = (
-                        curriculum_manager.progress()
+            timeout_rate = float(evaluation["overall"]["timeout_rate"])
+            checkpoint_metadata = {
+                "timesteps": total_steps,
+                "evaluation": evaluation,
+            }
+            if curriculum_manager is not None:
+                checkpoint_metadata["curriculum"] = (
+                    curriculum_manager.progress()
+                )
+
+            if evaluated_curriculum_depth is not None:
+                depth_best = best_by_depth.get(evaluated_curriculum_depth)
+                improves_depth = depth_best is None or (
+                    solve_rate > float(depth_best["solve_rate"])
+                    or (
+                        solve_rate == float(depth_best["solve_rate"])
+                        and timeout_rate < float(depth_best["timeout_rate"])
                     )
+                )
+                if improves_depth:
+                    best_by_depth[evaluated_curriculum_depth] = {
+                        "depth": evaluated_curriculum_depth,
+                        "solve_rate": solve_rate,
+                        "timeout_rate": timeout_rate,
+                        "timesteps": total_steps,
+                    }
+                    save_checkpoint(
+                        output_path
+                        / f"best_model_depth_{evaluated_curriculum_depth}.pt",
+                        model=model,
+                        config=ppo_config,
+                        network_config=network_config or NetworkConfig(),
+                        metadata={
+                            **checkpoint_metadata,
+                            "selection": "best_at_curriculum_depth",
+                            "evaluated_curriculum_depth": (
+                                evaluated_curriculum_depth
+                            ),
+                        },
+                    )
+
+                improves_curriculum_best = (
+                    evaluated_curriculum_depth > best_curriculum_depth
+                    or (
+                        evaluated_curriculum_depth == best_curriculum_depth
+                        and (
+                            solve_rate > best_solve_rate
+                            or (
+                                solve_rate == best_solve_rate
+                                and timeout_rate < best_timeout_rate
+                            )
+                        )
+                    )
+                )
+                if improves_curriculum_best:
+                    best_curriculum_depth = evaluated_curriculum_depth
+                    best_solve_rate = solve_rate
+                    best_timeout_rate = timeout_rate
+                    save_checkpoint(
+                        output_path / "best_model.pt",
+                        model=model,
+                        config=ppo_config,
+                        network_config=network_config or NetworkConfig(),
+                        metadata={
+                            **checkpoint_metadata,
+                            "selection": "curriculum_lexicographic",
+                            "evaluated_curriculum_depth": (
+                                evaluated_curriculum_depth
+                            ),
+                        },
+                    )
+
+                if advanced_curriculum:
+                    save_checkpoint(
+                        output_path / "latest_passed_gate.pt",
+                        model=model,
+                        config=ppo_config,
+                        network_config=network_config or NetworkConfig(),
+                        metadata={
+                            **checkpoint_metadata,
+                            "selection": "latest_passed_curriculum_gate",
+                            "passed_curriculum_depth": evaluated_curriculum_depth,
+                        },
+                    )
+            elif solve_rate > best_solve_rate:
+                best_solve_rate = solve_rate
                 save_checkpoint(
                     output_path / "best_model.pt",
                     model=model,
@@ -843,6 +922,23 @@ def train_ppo(
         "final_evaluation": final_evaluation,
         "random_baseline": random_baseline,
         "best_solve_rate": best_solve_rate,
+        "checkpoint_selection": (
+            {
+                "strategy": "curriculum_lexicographic",
+                "best_curriculum_depth": best_curriculum_depth,
+                "best_solve_rate": best_solve_rate,
+                "best_timeout_rate": best_timeout_rate,
+                "best_by_depth": {
+                    str(depth): values
+                    for depth, values in sorted(best_by_depth.items())
+                },
+            }
+            if curriculum_manager is not None
+            else {
+                "strategy": "highest_overall_solve_rate",
+                "best_solve_rate": best_solve_rate,
+            }
+        ),
         "curriculum_progress": (
             {
                 **curriculum_manager.progress(),
