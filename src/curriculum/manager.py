@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -154,6 +155,7 @@ class CurriculumManager:
         exhaustive_state_threshold: int | None = 500,
         validate_dataset: bool = True,
         seed: int | None = None,
+        warn_on_normalization: bool = True,
     ) -> None:
         if exhaustive_state_threshold is not None and exhaustive_state_threshold <= 0:
             raise ValueError("exhaustive_state_threshold must be positive")
@@ -170,7 +172,10 @@ class CurriculumManager:
             )
         self.state_column = state_column
         self.exhaustive_state_threshold = exhaustive_state_threshold
+        self.warn_on_normalization = warn_on_normalization
         self.current_depth = config.starting_depth
+        self.cross_depth_duplicates_removed: dict[int, int] = {}
+        self.solved_states_removed: dict[int, int] = {}
         self.depth_data = self._load_depth_data(validate_dataset)
         self._next_state_index_by_depth = {
             depth: 0 for depth in self.depth_data
@@ -302,6 +307,10 @@ class CurriculumManager:
             "sampling_strategy": self.config.sampling_strategy,
             "current_weights": self.current_weights(),
             "events": list(self.events),
+            "cross_depth_duplicates_removed": dict(
+                self.cross_depth_duplicates_removed
+            ),
+            "solved_states_removed": dict(self.solved_states_removed),
         }
 
     def _sample_depth(self) -> int:
@@ -335,15 +344,51 @@ class CurriculumManager:
                     raise ValueError(
                         f"Depth {depth} file contains duplicate states: {path}"
                     )
-                if set(states) & seen_states:
-                    raise ValueError(
-                        f"Depth {depth} file contains states already loaded "
-                        "from another depth"
-                    )
-                if SOLVED_STATE_STRING in set(states):
-                    raise ValueError(
-                        f"Depth {depth} file contains the solved state: {path}"
-                    )
+                cross_depth_mask = pd.Series(states).isin(seen_states).to_numpy()
+                removed_count = int(cross_depth_mask.sum())
+                if removed_count:
+                    frame = frame.loc[~cross_depth_mask].reset_index(drop=True)
+                    states = [
+                        str(value).strip()
+                        for value in frame[self.state_column]
+                    ]
+                    self.cross_depth_duplicates_removed[depth] = removed_count
+                    if self.warn_on_normalization:
+                        warnings.warn(
+                            f"Removed {removed_count} state(s) from depth "
+                            f"{depth} because they already occur at a shallower "
+                            "curriculum depth.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    if frame.empty:
+                        raise ValueError(
+                            f"Depth {depth} contains no states after removing "
+                            "states already available at shallower depths"
+                        )
+                solved_mask = pd.Series(states).eq(
+                    SOLVED_STATE_STRING
+                ).to_numpy()
+                solved_count = int(solved_mask.sum())
+                if solved_count:
+                    frame = frame.loc[~solved_mask].reset_index(drop=True)
+                    states = [
+                        str(value).strip()
+                        for value in frame[self.state_column]
+                    ]
+                    self.solved_states_removed[depth] = solved_count
+                    if self.warn_on_normalization:
+                        warnings.warn(
+                            f"Removed {solved_count} solved state(s) from depth "
+                            f"{depth}; solved states cannot start curriculum "
+                            "episodes.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    if frame.empty:
+                        raise ValueError(
+                            f"Depth {depth} contains no unsolved states"
+                        )
             seen_states.update(states)
             depth_data[depth] = frame
         return depth_data

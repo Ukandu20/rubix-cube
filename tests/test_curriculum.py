@@ -29,6 +29,49 @@ from curriculum.manager import (  # noqa: E402
 
 
 class CurriculumManagerTests(unittest.TestCase):
+    def test_cross_depth_duplicates_are_kept_only_at_shallowest_depth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repeated = _row_for_moves("R")
+            unique_depth_2 = _row_for_moves("U R")
+            files = {
+                1: _write_depth_csv(root, 1, [repeated]),
+                2: _write_depth_csv(root, 2, [repeated, unique_depth_2]),
+            }
+
+            with self.assertWarnsRegex(UserWarning, "Removed 1 state"):
+                manager = CurriculumManager(files, _config(max_depth=2))
+
+        self.assertEqual(len(manager.depth_data[1]), 1)
+        self.assertEqual(len(manager.depth_data[2]), 1)
+        self.assertEqual(
+            manager.depth_data[2].iloc[0]["state_encoded"],
+            unique_depth_2["state_encoded"],
+        )
+        self.assertEqual(manager.cross_depth_duplicates_removed, {2: 1})
+        self.assertEqual(
+            manager.progress()["cross_depth_duplicates_removed"],
+            {2: 1},
+        )
+
+    def test_solved_states_are_removed_from_curriculum_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            solved = _row_for_moves("R R R R")
+            unsolved = _row_for_moves("U R")
+            path = _write_depth_csv(root, 1, [solved, unsolved])
+
+            with self.assertWarnsRegex(UserWarning, "Removed 1 solved state"):
+                manager = CurriculumManager({1: path}, _config())
+
+        self.assertEqual(len(manager.depth_data[1]), 1)
+        self.assertEqual(
+            manager.depth_data[1].iloc[0]["state_encoded"],
+            unsolved["state_encoded"],
+        )
+        self.assertEqual(manager.solved_states_removed, {1: 1})
+        self.assertEqual(manager.progress()["solved_states_removed"], {1: 1})
+
     def test_default_configuration_matches_specification(self):
         config = load_curriculum_config()
 

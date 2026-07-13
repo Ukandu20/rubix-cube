@@ -86,6 +86,7 @@ class RubixCubeSolveEnv(gym.Env):
         validate_dataset: bool = True,
         exhaustive_state_threshold: int | None = None,
         curriculum_manager: Any | None = None,
+        state_data: Mapping[int, pd.DataFrame] | None = None,
     ) -> None:
         if max_episode_steps <= 0:
             raise ValueError("max_episode_steps must be positive")
@@ -137,11 +138,15 @@ class RubixCubeSolveEnv(gym.Env):
         self.action_space = spaces.Discrete(len(ACTION_TO_MOVE))
         self.solved_state = decode_state(SOLVED_STATE_STRING)
 
-        self.states_by_depth = (
-            curriculum_manager.depth_data
-            if curriculum_manager is not None
-            else self._load_state_files(validate_dataset)
-        )
+        if curriculum_manager is not None:
+            self.states_by_depth = curriculum_manager.depth_data
+        elif state_data is not None:
+            self.states_by_depth = {
+                int(depth): frame.reset_index(drop=True).copy()
+                for depth, frame in state_data.items()
+            }
+        else:
+            self.states_by_depth = self._load_state_files(validate_dataset)
         self._validate_depth_configuration()
         self._next_state_index_by_depth = {
             depth: 0 for depth in self.states_by_depth

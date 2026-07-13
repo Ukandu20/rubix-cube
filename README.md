@@ -54,7 +54,8 @@ large processed training datasets.
 python -m streamlit run streamlit_app.py
 ```
 
-The app discovers trusted local checkpoints under `models/artifacts/ppo`.
+The app discovers trusted local custom-PPO `.pt` and Stable-Baselines3 `.zip`
+checkpoints under `models/artifacts`.
 Artifacts remain gitignored and must exist on the machine running the app.
 Checkpoint curriculum metadata is displayed in the sidebar; scramble lengths
 beyond the checkpoint's evaluated depths are marked as experimental.
@@ -78,3 +79,22 @@ CSV files.
 Use `python -m streamlit` rather than the global `streamlit` command so the app
 runs with the same Python interpreter where the project dependencies, including
 PyTorch, were installed.
+
+## PPO trainers
+
+The original custom PyTorch trainer remains available:
+
+```powershell
+python scripts/train_ppo_agent.py
+```
+
+Stable-Baselines3 is available as a parallel trainer with a separate artifact
+namespace:
+
+```powershell
+python scripts/train_sb3_ppo_agent.py
+```
+
+See [reports/sb3_parallel_trainer.md](reports/sb3_parallel_trainer.md) for
+checkpoint semantics, resume instructions, controlled-comparison commands, and
+the differences that prevent bit-for-bit equivalence between trainers.

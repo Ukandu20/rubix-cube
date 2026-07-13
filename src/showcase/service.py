@@ -48,6 +48,7 @@ class CheckpointInfo:
     run_curriculum_depth: int
     observation_encoding: str
     timesteps: int
+    trainer: str = "custom"
 
     def supports(self, scramble_length: int) -> bool:
         return scramble_length <= self.validated_depth
@@ -228,18 +229,72 @@ def load_torch_policy(path: Path | str) -> TorchPolicy:
     return TorchPolicy(model)
 
 
+class SB3Policy:
+    """Showcase adapter for a Stable-Baselines3 categorical policy."""
+
+    def __init__(self, model: object) -> None:
+        self.model = model
+
+    def decide(
+        self,
+        state: str,
+        *,
+        greedy: bool,
+        temperature: float,
+        rng: random.Random,
+    ) -> ActionDecision:
+        observation = np.fromiter(
+            ("YOGWRB".index(sticker) for sticker in state),
+            dtype=np.int64,
+            count=OBSERVATION_SIZE,
+        )
+        encoded = np.eye(6, dtype=np.float32)[observation].reshape(1, -1)
+        observation_tensor, _ = self.model.policy.obs_to_tensor(encoded)
+        with torch.no_grad():
+            distribution = self.model.policy.get_distribution(observation_tensor)
+            logits = distribution.distribution.logits[0] / temperature
+            probabilities = torch.softmax(logits, dim=0)
+        values = tuple(float(value) for value in probabilities.cpu().tolist())
+        action = (
+            max(range(len(values)), key=values.__getitem__)
+            if greedy
+            else rng.choices(range(len(values)), weights=values, k=1)[0]
+        )
+        return ActionDecision(action=action, probabilities=values)
+
+
+def load_policy(path: Path | str) -> Policy:
+    """Load either checkpoint format through the common showcase interface."""
+
+    checkpoint_path = Path(path)
+    if checkpoint_path.suffix == ".pt":
+        return load_torch_policy(checkpoint_path)
+    if checkpoint_path.suffix == ".zip":
+        try:
+            from stable_baselines3 import PPO
+        except ImportError as exc:  # pragma: no cover - optional install state
+            raise ImportError("Loading SB3 checkpoints requires stable-baselines3") from exc
+        return SB3Policy(PPO.load(checkpoint_path, device="cpu"))
+    raise ValueError(f"unsupported PPO checkpoint format: {checkpoint_path.suffix}")
+
+
 def discover_checkpoints(root: Path | str) -> list[CheckpointInfo]:
     """Discover compatible best/final PPO checkpoints and inspect metadata."""
 
     artifact_root = Path(root)
     if not artifact_root.exists():
         return []
-    checkpoints = [
+    custom_checkpoints = [
         _inspect_checkpoint(path, artifact_root)
         for path in artifact_root.rglob("*.pt")
         if path.name in {"best_model.pt", "final_model.pt"}
     ]
-    return sorted(checkpoints, key=_checkpoint_rank)
+    sb3_checkpoints = [
+        _inspect_sb3_checkpoint(path, artifact_root)
+        for path in artifact_root.rglob("*.zip")
+        if path.name in {"best_model.zip", "final_model.zip"}
+    ]
+    return sorted(custom_checkpoints + sb3_checkpoints, key=_checkpoint_rank)
 
 
 def _checkpoint_rank(checkpoint: CheckpointInfo) -> tuple:
@@ -253,7 +308,7 @@ def _checkpoint_rank(checkpoint: CheckpointInfo) -> tuple:
         -checkpoint.checkpoint_curriculum_depth,
         -checkpoint.run_curriculum_depth,
         -checkpoint.timesteps,
-        checkpoint.path.name != "final_model.pt",
+        checkpoint.path.name not in {"final_model.pt", "final_model.zip"},
         checkpoint.label,
     )
 
@@ -299,6 +354,39 @@ def _inspect_checkpoint(path: Path, root: Path) -> CheckpointInfo:
         run_curriculum_depth=run_depth,
         observation_encoding=encoding,
         timesteps=timesteps,
+    )
+
+
+def _inspect_sb3_checkpoint(path: Path, root: Path) -> CheckpointInfo:
+    """Inspect an SB3 sidecar without loading the comparatively large archive."""
+
+    compatible = True
+    error: str | None = None
+    validated_depth = checkpoint_depth = run_depth = timesteps = 0
+    try:
+        sidecar = path.with_suffix(".metadata.json")
+        metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+        if metadata.get("trainer") != "stable_baselines3":
+            raise ValueError("missing Stable-Baselines3 checkpoint metadata")
+        timesteps = int(metadata.get("timesteps", 0))
+        evaluated = [
+            int(depth)
+            for depth in metadata.get("evaluation", {}).get("by_depth", {})
+        ]
+        validated_depth = max(evaluated, default=0)
+        checkpoint_depth = int(
+            metadata.get("curriculum", {}).get("current_depth", validated_depth)
+        )
+        run_depth = _read_run_curriculum_depth(path.parent, checkpoint_depth)
+    except Exception as exc:
+        compatible = False
+        error = str(exc)
+    return CheckpointInfo(
+        path=path.resolve(), label=path.relative_to(root).as_posix(),
+        compatible=compatible, error=error, validated_depth=validated_depth,
+        checkpoint_curriculum_depth=checkpoint_depth,
+        run_curriculum_depth=run_depth, observation_encoding="one_hot",
+        timesteps=timesteps, trainer="stable_baselines3",
     )
 
 

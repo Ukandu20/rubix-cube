@@ -305,6 +305,7 @@ def make_eval_env(
     max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
     data_dir: Path | str = DEFAULT_TRAINING_DATA_DIR,
     validate_dataset: bool = True,
+    state_data: Mapping[int, Any] | None = None,
 ) -> RubixCubeSolveEnv:
     """Create a fixed-depth evaluation environment."""
 
@@ -315,6 +316,7 @@ def make_eval_env(
         max_episode_steps=max_episode_steps,
         validate_dataset=validate_dataset,
         exhaustive_state_threshold=EXHAUSTIVE_STATE_THRESHOLD,
+        state_data=state_data,
     )
 
 
@@ -661,6 +663,11 @@ def train_ppo(
         data_dir=data_dir,
         seed=seed,
         validate_dataset=validate_dataset,
+        state_data=(
+            curriculum_manager.depth_data
+            if curriculum_manager is not None
+            else None
+        ),
     )
 
     while total_steps < total_timesteps:
@@ -722,6 +729,11 @@ def train_ppo(
                 data_dir=data_dir,
                 device=run_device,
                 validate_dataset=validate_dataset,
+                state_data=(
+                    curriculum_manager.depth_data
+                    if curriculum_manager is not None
+                    else None
+                ),
             )
             row["evaluation"] = evaluation
             advanced_curriculum = False
@@ -877,6 +889,11 @@ def train_ppo(
         data_dir=data_dir,
         device=run_device,
         validate_dataset=validate_dataset,
+        state_data=(
+            curriculum_manager.depth_data
+            if curriculum_manager is not None
+            else None
+        ),
     )
     final_checkpoint_metadata = {
         "timesteps": total_steps,
@@ -973,6 +990,7 @@ def evaluate_ppo_model(
     device: torch.device | str | None = None,
     validate_dataset: bool = True,
     behavior_logger: BehaviorLogger | None = None,
+    state_data: Mapping[int, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate a deterministic PPO policy by scramble depth."""
 
@@ -987,6 +1005,7 @@ def evaluate_ppo_model(
         random_policy=False,
         validate_dataset=validate_dataset,
         behavior_logger=behavior_logger,
+        state_data=state_data,
     )
 
 
@@ -998,6 +1017,7 @@ def evaluate_random_baseline(
     data_dir: Path | str = DEFAULT_TRAINING_DATA_DIR,
     seed: int = 0,
     validate_dataset: bool = True,
+    state_data: Mapping[int, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate uniformly random actions on the same Gymnasium environment."""
 
@@ -1011,6 +1031,7 @@ def evaluate_random_baseline(
         random_policy=True,
         validate_dataset=validate_dataset,
         behavior_logger=None,
+        state_data=state_data,
     )
 
 
@@ -1107,6 +1128,7 @@ def _evaluate_policy(
     validate_dataset: bool,
     behavior_logger: BehaviorLogger | None,
     device: torch.device | str | None = None,
+    state_data: Mapping[int, Any] | None = None,
 ) -> dict[str, Any]:
     if episodes_per_depth <= 0:
         raise ValueError("episodes_per_depth must be positive")
@@ -1119,6 +1141,11 @@ def _evaluate_policy(
             max_episode_steps=max_episode_steps,
             data_dir=data_dir,
             validate_dataset=validate_dataset,
+            state_data=(
+                {int(depth): state_data[int(depth)]}
+                if state_data is not None
+                else None
+            ),
         )
         if seed is not None:
             env.action_space.seed(seed + int(depth))

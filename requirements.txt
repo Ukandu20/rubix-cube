@@ -11,4 +11,5 @@ python-dotenv
 requests
 pyyaml
 torch
+stable-baselines3==2.9.0
 streamlit

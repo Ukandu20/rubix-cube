@@ -23,7 +23,7 @@ from showcase.service import (  # noqa: E402
     benchmark_to_csv,
     discover_checkpoints,
     load_curriculum_weights,
-    load_torch_policy,
+    load_policy,
     records_to_csv,
     run_benchmark,
     run_solver,
@@ -33,7 +33,7 @@ from showcase.service import (  # noqa: E402
 from showcase.visualization import cube_net_html  # noqa: E402
 
 
-ARTIFACT_ROOT = PROJECT_ROOT / "models" / "artifacts" / "ppo"
+ARTIFACT_ROOT = PROJECT_ROOT / "models" / "artifacts"
 CURRICULUM_PATH = PROJECT_ROOT / "config" / "curriculum_config_depth_1_10.yaml"
 
 
@@ -61,7 +61,7 @@ def cached_curriculum_weights(path: str) -> dict[int, dict[int, float]]:
 @st.cache_resource(show_spinner="Loading PPO checkpoint...")
 def cached_policy(path: str, modified_ns: int):
     del modified_ns
-    return load_torch_policy(path)
+    return load_policy(path)
 
 
 def main() -> None:
@@ -78,6 +78,8 @@ def main() -> None:
         if path.name in {
             "best_model.pt",
             "final_model.pt",
+            "best_model.zip",
+            "final_model.zip",
             "curriculum_progress.json",
         }
     ) if ARTIFACT_ROOT.exists() else ()
