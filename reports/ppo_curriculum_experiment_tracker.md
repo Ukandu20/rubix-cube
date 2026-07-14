@@ -56,6 +56,24 @@ Baseline notes from `v004`:
 - Used `2,000,000` configured training timesteps.
 - Depth-6 evaluation still failed the advancement gate because solve rate was too low and timeout rate was too high.
 
+## Supervised warm-start experiment fields
+
+For SB3 actor warm-start experiments, record the following beside the normal
+PPO budget, seed, curriculum thresholds, and final metrics:
+
+- initialization mode and supervised depth mode/range;
+- warm-start checkpoint and split-manifest hashes;
+- dataset and split counts by exact depth;
+- supervised runtime, best epoch, and validation macro loss/accuracy;
+- pre-PPO train/validation/test greedy rollout metrics;
+- PPO timesteps to the first stable depth-6 gate and later gates;
+- retention on mastered depths and KL drift from the restored warm actor.
+
+Compare warm and scratch runs both by equal PPO timesteps and by total compute.
+Classification accuracy alone is not evidence of improved solving; the primary
+sparse-reward measure is PPO timesteps to stable depth-6 success without
+material regression on depths 1-5.
+
 ## Experiment 001: More depth-6+ exposure with longer training
 
 Status: completed

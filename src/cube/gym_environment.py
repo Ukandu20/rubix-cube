@@ -235,6 +235,30 @@ class RubixCubeSolveEnv(gym.Env):
         }
         return self.get_observation(), info
 
+    def exclude_states(self, states_by_depth: Mapping[int, set[str] | list[str]]) -> None:
+        """Remove held-out encoded states before training or evaluation resets."""
+
+        for raw_depth, excluded_values in states_by_depth.items():
+            depth = int(raw_depth)
+            if depth not in self.states_by_depth:
+                continue
+            excluded = {str(value).strip() for value in excluded_values}
+            if not excluded:
+                continue
+            frame = self.states_by_depth[depth]
+            retained = frame.loc[
+                ~frame[self.state_column].astype(str).str.strip().isin(excluded)
+            ].reset_index(drop=True)
+            if retained.empty:
+                raise ValueError(
+                    f"excluding held-out states leaves depth {depth} empty"
+                )
+            self.states_by_depth[depth] = retained
+            if self.curriculum_manager is not None:
+                self.curriculum_manager.depth_data[depth] = retained
+                self.curriculum_manager._next_state_index_by_depth[depth] = 0
+            self._next_state_index_by_depth[depth] = 0
+
     def step(
         self, action: int
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:

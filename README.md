@@ -95,6 +95,21 @@ namespace:
 python scripts/train_sb3_ppo_agent.py
 ```
 
+An optional supervised actor warm start can initialize SB3 from labeled
+first-solution moves without reducing the PPO timestep budget. For the initial
+depth-6 frontier experiment:
+
+```powershell
+python scripts/train_sb3_ppo_agent.py `
+  --curriculum-config config/curriculum_config_depth_1_10.yaml `
+  --supervised-warm-start `
+  --pretrain-depth-mode frontier `
+  --pretrain-max-depth 6
+```
+
+Scratch initialization remains the default. Warm start and `--resume-from`
+are intentionally mutually exclusive.
+
 See [reports/sb3_parallel_trainer.md](reports/sb3_parallel_trainer.md) for
 checkpoint semantics, resume instructions, controlled-comparison commands, and
 the differences that prevent bit-for-bit equivalence between trainers.

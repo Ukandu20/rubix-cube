@@ -62,6 +62,36 @@ python scripts/train_sb3_ppo_agent.py `
 Resume restores the current curriculum depth, advancement events, evaluation
 history, timestep counter, and checkpoint ranking state.
 
+## Supervised actor warm start
+
+The SB3 trainer can pretrain its independent actor MLP from labeled cube states
+before collecting PPO rollouts. The critic remains at its original random
+initialization, the supervised optimizer is discarded, and PPO receives its
+full configured timestep budget with a fresh optimizer.
+
+```powershell
+python scripts/train_sb3_ppo_agent.py `
+  --curriculum-config config/curriculum_config_depth_1_10.yaml `
+  --supervised-warm-start `
+  --pretrain-depth-mode frontier `
+  --pretrain-max-depth 6 `
+  --pretrain-depth-sampling balanced `
+  --pretrain-sample-per-depth 100000 `
+  --pretrain-epochs 10
+```
+
+`mastered` excludes the declared maximum depth, `frontier` includes it,
+`full-curriculum` selects the configured range, and `custom` requires explicit
+minimum and maximum depths. The test partition is removed from every PPO reset;
+validation states remain available to PPO after supervised model selection.
+
+Warm runs save best/last `.pt` actor checkpoints, a deterministic split
+manifest, supervised metrics, transition diagnostics, and an experiment
+summary beside the normal SB3 `.zip` checkpoints. All PPO sidecars retain the
+warm-start checkpoint hash and data provenance. Warm start cannot be combined
+with `--resume-from`, because applying behavior cloning to a resumed actor is a
+different intervention experiment.
+
 ## Controlled comparison
 
 The current custom CLI defaults differ from the SB3 module defaults. Pass every

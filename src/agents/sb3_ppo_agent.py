@@ -26,6 +26,12 @@ from agents.ppo_agent import (
 )
 from cube.gym_environment import DEFAULT_MAX_EPISODE_STEPS, DEFAULT_TRAINING_DATA_DIR
 from curriculum.manager import CurriculumConfig, CurriculumManager
+from agents.sb3_supervised_warm_start import (
+    SupervisedWarmStartConfig,
+    reset_ppo_optimizer,
+    run_supervised_warm_start,
+    transition_snapshot,
+)
 
 
 DEFAULT_SB3_OUTPUT_DIR = Path("models/artifacts/sb3_ppo")
@@ -110,6 +116,7 @@ def make_sb3_env_factory(
     seed: int = 42,
     rank: int = 0,
     validate_dataset: bool = True,
+    state_data: Mapping[int, Any] | None = None,
 ) -> Callable[[], gym.Env]:
     """Create one independently seeded curriculum environment for a VecEnv."""
 
@@ -124,6 +131,7 @@ def make_sb3_env_factory(
             validate_dataset=validate_dataset,
             seed=seed + rank,
             warn_on_normalization=False,
+            state_data=state_data,
         )
         env = make_training_env(
             data_dir=data_dir,
@@ -164,6 +172,8 @@ def build_curriculum_callback(
     initial_timesteps: int = 0,
     previous_evaluations: list[dict[str, Any]] | None = None,
     previous_selection: Mapping[str, Any] | None = None,
+    initialization_metadata: Mapping[str, Any] | None = None,
+    warm_start_context: Mapping[str, Any] | None = None,
 ) -> Any:
     """Build a callback preserving curriculum gates and checkpoint ranking."""
 
@@ -189,6 +199,40 @@ def build_curriculum_callback(
             self.next_evaluation = (
                 (initial_timesteps // eval_frequency) + 1
             ) * eval_frequency
+            self.initialization_metadata = dict(initialization_metadata or {})
+            self.warm_start_context = dict(warm_start_context or {})
+            self.transition_diagnostics = list(
+                self.warm_start_context.get("initial_diagnostics", [])
+            )
+            self.rollouts_completed = 0
+            self.first_update_recorded = False
+
+        def _diagnostic(self, phase: str) -> dict[str, Any] | None:
+            examples = self.warm_start_context.get("diagnostic_examples")
+            reference = self.warm_start_context.get("reference_probabilities")
+            if examples is None or reference is None:
+                return None
+            row = transition_snapshot(
+                self.model,
+                examples,
+                reference,
+                phase=phase,
+                logger_values=getattr(self.logger, "name_to_value", {}),
+                curriculum=manager.config,
+                mastered_states=self.warm_start_context.get("mastered_states", set()),
+            )
+            self.transition_diagnostics.append(row)
+            return row
+
+        def _on_rollout_start(self) -> None:
+            if self.rollouts_completed == 1 and not self.first_update_recorded:
+                self._diagnostic("after_first_ppo_update")
+                self.first_update_recorded = True
+
+        def _on_rollout_end(self) -> None:
+            if self.rollouts_completed == 0:
+                self._diagnostic("after_first_ppo_rollout")
+            self.rollouts_completed += 1
 
         def _on_step(self) -> bool:
             if self.num_timesteps < self.next_evaluation:
@@ -222,12 +266,16 @@ def build_curriculum_callback(
                 "advanced_curriculum": advanced,
                 "next_curriculum_depth": manager.get_current_depth(),
             }
+            diagnostic = self._diagnostic("curriculum_evaluation")
+            if diagnostic is not None:
+                row["transition_diagnostic"] = diagnostic
             self.evaluations.append(row)
             metadata = {
                 "trainer": "stable_baselines3",
                 "timesteps": self.num_timesteps,
                 "evaluation": evaluation,
                 "curriculum": manager.progress(),
+                **self.initialization_metadata,
             }
             previous = self.best_by_depth.get(depth)
             if previous is None or (solve_rate, -timeout_rate) > (previous[0], -previous[1]):
@@ -256,7 +304,12 @@ def build_curriculum_callback(
                 )
             _write_json(
                 output_dir / "curriculum_progress.json",
-                {**manager.progress(), "evaluations": self.evaluations},
+                {
+                    **manager.progress(),
+                    "evaluations": self.evaluations,
+                    **self.initialization_metadata,
+                    "transition_diagnostics": self.transition_diagnostics,
+                },
             )
             while self.next_evaluation <= self.num_timesteps:
                 self.next_evaluation += eval_frequency
@@ -301,11 +354,14 @@ def train_sb3_ppo(
     validate_dataset: bool = True,
     output_metadata: Mapping[str, Any] | None = None,
     resume_from: Path | str | None = None,
+    supervised_config: SupervisedWarmStartConfig | None = None,
 ) -> dict[str, Any]:
     """Train SB3 PPO without mutating or depending on the custom trainer path."""
 
     if min(total_timesteps, eval_frequency, eval_episodes, n_envs) <= 0:
         raise ValueError("timesteps, evaluation values, and n_envs must be positive")
+    if supervised_config is not None and resume_from is not None:
+        raise ValueError("supervised warm start cannot be combined with resume_from")
     PPO, _, DummyVecEnv, SubprocVecEnv = _require_sb3()
     cfg = config or SB3PPOConfig()
     output_path = Path(output_dir)
@@ -325,6 +381,7 @@ def train_sb3_ppo(
         make_sb3_env_factory(
             curriculum_config=curriculum_config, data_dir=data_dir, seed=seed,
             rank=rank, validate_dataset=validate_dataset,
+            state_data=(manager.depth_data if not subprocess else None),
         )
         for rank in range(n_envs)
     ]
@@ -346,6 +403,53 @@ def train_sb3_ppo(
         )
     else:
         model = PPO.load(Path(resume_from), env=vec_env, device=device)
+    warm_result: dict[str, Any] | None = None
+    initialization_metadata: dict[str, Any] = {"initialization_mode": "scratch"}
+    warm_context: dict[str, Any] | None = None
+    if supervised_config is not None:
+        warm_result = run_supervised_warm_start(
+            model,
+            config=supervised_config,
+            curriculum=curriculum_config,
+            data_dir=data_dir,
+            output_dir=output_path,
+            seed=seed,
+            state_data=manager.depth_data,
+        )
+        initialization_metadata = dict(warm_result["provenance"])
+        held_out = {
+            int(depth): sorted(states)
+            for depth, states in warm_result["test_states_by_depth"].items()
+        }
+        vec_env.env_method("exclude_states", held_out)
+        for depth, states in held_out.items():
+            if depth not in manager.depth_data:
+                continue
+            frame = manager.depth_data[depth]
+            retained = frame.loc[
+                ~frame["state_encoded"].astype(str).str.strip().isin(states)
+            ].reset_index(drop=True)
+            if retained.empty:
+                raise ValueError(f"excluding held-out states leaves depth {depth} empty")
+            manager.depth_data[depth] = retained
+            manager._next_state_index_by_depth[depth] = 0
+        reset_ppo_optimizer(model)
+        warm_context = {
+            "diagnostic_examples": warm_result["diagnostic_examples"],
+            "reference_probabilities": warm_result["reference_probabilities"],
+            "mastered_states": warm_result["mastered_states"],
+            "initial_diagnostics": [
+                {
+                    "phase": "before_supervised_pretraining",
+                    "metrics": warm_result["metrics"]["before_supervised_pretraining"],
+                },
+                {
+                    "phase": "after_supervised_pretraining",
+                    "metrics": warm_result["metrics"]["after_supervised_pretraining"],
+                    "kl_from_warm_start": 0.0,
+                },
+            ],
+        }
     initial_timesteps = int(model.num_timesteps)
     vec_env.env_method("set_curriculum_depth", manager.get_current_depth())
     callback = build_curriculum_callback(
@@ -354,6 +458,8 @@ def train_sb3_ppo(
         validate_dataset=validate_dataset, initial_timesteps=initial_timesteps,
         previous_evaluations=previous_evaluations,
         previous_selection=previous_selection,
+        initialization_metadata=initialization_metadata,
+        warm_start_context=warm_context,
     )
     started_at = utc_timestamp()
     start = perf_counter()
@@ -363,6 +469,9 @@ def train_sb3_ppo(
             callback=callback,
             reset_num_timesteps=resume_from is None,
         )
+        if warm_result is not None and not callback.first_update_recorded:
+            callback._diagnostic("after_first_ppo_update")
+            callback.first_update_recorded = True
     finally:
         vec_env.close()
     elapsed = perf_counter() - start
@@ -377,6 +486,7 @@ def train_sb3_ppo(
     metadata = {
         "trainer": "stable_baselines3", "timesteps": model.num_timesteps,
         "evaluation": final_evaluation, "curriculum": manager.progress(),
+        **initialization_metadata,
     }
     _save_sb3_checkpoint(model, output_path / "final_model.zip", metadata=metadata)
     random_baseline = evaluate_random_baseline(
@@ -392,6 +502,7 @@ def train_sb3_ppo(
         "resume_from": str(resume_from) if resume_from is not None else None,
         "n_envs": n_envs, "subprocess": subprocess, "ppo": asdict(cfg),
         "curriculum": curriculum_config.to_dict(),
+        **initialization_metadata,
         "training_session": {"started_at": started_at, "completed_at": utc_timestamp(), "elapsed_seconds": elapsed},
         **dict(output_metadata or {}),
     }
@@ -414,8 +525,24 @@ def train_sb3_ppo(
         "curriculum_progress": {
             **manager.progress(),
             "evaluations": callback.evaluations,
+            **initialization_metadata,
+            "transition_diagnostics": callback.transition_diagnostics,
         },
+        "transition_diagnostics": callback.transition_diagnostics,
+    }
+    if warm_result is not None:
+        metrics["supervised_warm_start"] = warm_result["metrics"]
+    experiment_summary = {
+        "trainer": "stable_baselines3",
+        "ppo_timesteps": model.num_timesteps - initial_timesteps,
+        "total_runtime_seconds": elapsed + float(
+            initialization_metadata.get("supervised_runtime_seconds", 0.0)
+        ),
+        **initialization_metadata,
+        "final_evaluation": final_evaluation,
+        "curriculum_progress": manager.progress(),
     }
     _write_json(output_path / "config.json", run_config)
     _write_json(output_path / "metrics.json", metrics)
+    _write_json(output_path / "experiment_summary.json", experiment_summary)
     return {"model": model, "config": run_config, "metrics": metrics, "output_dir": output_path}

@@ -173,6 +173,7 @@ def resolve_training_output_dir(
     observation_encoding: str,
     version: str | None,
     overwrite: bool,
+    experiment_suffix: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Resolve the destination folder for a PPO training run."""
 
@@ -191,6 +192,7 @@ def resolve_training_output_dir(
         min_depth=min_depth,
         max_depth=max_depth,
         observation_encoding=observation_encoding,
+        experiment_suffix=experiment_suffix,
     )
     experiment_dir = Path(output_root) / experiment_name
     resolved_version = (
@@ -214,6 +216,7 @@ def build_experiment_name(
     min_depth: int,
     max_depth: int,
     observation_encoding: str,
+    experiment_suffix: str | None = None,
 ) -> str:
     """Build a readable experiment name from depth range and encoding."""
 
@@ -226,7 +229,12 @@ def build_experiment_name(
         if observation_encoding == "one_hot"
         else _safe_name_component(observation_encoding)
     )
-    return f"{depth_label}_{encoding_label}"
+    suffix = (
+        f"_{_safe_name_component(experiment_suffix)}"
+        if experiment_suffix and str(experiment_suffix).strip()
+        else ""
+    )
+    return f"{depth_label}_{encoding_label}{suffix}"
 
 
 def _auto_version_for(experiment_dir: Path, *, overwrite: bool) -> str:

@@ -156,6 +156,7 @@ class CurriculumManager:
         validate_dataset: bool = True,
         seed: int | None = None,
         warn_on_normalization: bool = True,
+        state_data: Mapping[int, pd.DataFrame] | None = None,
     ) -> None:
         if exhaustive_state_threshold is not None and exhaustive_state_threshold <= 0:
             raise ValueError("exhaustive_state_threshold must be positive")
@@ -176,7 +177,20 @@ class CurriculumManager:
         self.current_depth = config.starting_depth
         self.cross_depth_duplicates_removed: dict[int, int] = {}
         self.solved_states_removed: dict[int, int] = {}
-        self.depth_data = self._load_depth_data(validate_dataset)
+        if state_data is None:
+            self.depth_data = self._load_depth_data(validate_dataset)
+        else:
+            supplied_depths = {int(depth) for depth in state_data}
+            if supplied_depths != expected_depths:
+                raise ValueError(
+                    "state_data must cover every configured curriculum depth"
+                )
+            self.depth_data = {
+                int(depth): frame
+                for depth, frame in state_data.items()
+            }
+            if any(frame.empty for frame in self.depth_data.values()):
+                raise ValueError("state_data cannot contain an empty depth frame")
         self._next_state_index_by_depth = {
             depth: 0 for depth in self.depth_data
         }

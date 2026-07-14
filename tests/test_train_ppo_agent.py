@@ -32,6 +32,16 @@ class TrainPPOAgentScriptTests(unittest.TestCase):
 
         self.assertEqual(name, "depth_1_2_normalized")
 
+    def test_experiment_name_includes_optional_warm_start_suffix(self):
+        name = build_experiment_name(
+            min_depth=1,
+            max_depth=10,
+            observation_encoding="one_hot",
+            experiment_suffix="warm_frontier_1_6",
+        )
+
+        self.assertEqual(name, "depth_1_10_onehot_warm_frontier_1_6")
+
     def test_first_auto_version_resolves_to_v001(self):
         with tempfile.TemporaryDirectory() as directory:
             output_dir, metadata = resolve_training_output_dir(
