@@ -29,11 +29,11 @@ curriculum:
       max_average_moves: 10
       max_timeout_rate: 0.20
     6:
-      success_rate: 0.70
+      success_rate: 0.75
       max_average_moves: 12
-      max_timeout_rate: 0.20
+      max_timeout_rate: 0.25
     7:
-      success_rate: 0.70
+      success_rate: 0.75
       max_average_moves: 14
       max_timeout_rate: 0.25
 
@@ -59,17 +59,17 @@ curriculum:
       4: 0.25
       5: 0.30
     6:
-      1: 0.05
-      2: 0.10
-      3: 0.10
-      4: 0.15
-      5: 0.20
-      6: 0.40
-    7:
-      1: 0.05
-      2: 0.05
-      3: 0.10
+      1: 0.025
+      2: 0.025
+      3: 0.05
       4: 0.10
-      5: 0.10
-      6: 0.20
-      7: 0.40
+      5: 0.25
+      6: 0.55
+    7:
+      1: 0.01
+      2: 0.01
+      3: 0.02
+      4: 0.06
+      5: 0.14
+      6: 0.21
+      7: 0.55
