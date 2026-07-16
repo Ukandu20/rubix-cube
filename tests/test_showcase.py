@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 import shutil
 import unittest
 from pathlib import Path
@@ -8,9 +7,6 @@ from pathlib import Path
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
 
 from cube.environment import ACTION_TO_MOVE, MOVE_TO_ACTION  # noqa: E402
 from cube.moves import apply_move  # noqa: E402
@@ -76,19 +72,13 @@ class ShowcaseTests(unittest.TestCase):
         )
 
     def test_seeded_scramble_modes_are_reproducible(self):
-        first = sample_scramble(
-            mode="range", minimum=2, maximum=7, seed=123
-        )
-        second = sample_scramble(
-            mode="range", minimum=2, maximum=7, seed=123
-        )
+        first = sample_scramble(mode="range", minimum=2, maximum=7, seed=123)
+        second = sample_scramble(mode="range", minimum=2, maximum=7, seed=123)
         self.assertEqual(first, second)
         self.assertGreaterEqual(first[0], 2)
         self.assertLessEqual(first[0], 7)
 
-        exact = sample_scramble(
-            mode="exact", minimum=6, maximum=6, seed=9
-        )
+        exact = sample_scramble(mode="exact", minimum=6, maximum=6, seed=9)
         self.assertEqual(exact[0], 6)
         self.assertEqual(len(exact[1].split()), 6)
 
@@ -187,13 +177,7 @@ class ShowcaseTests(unittest.TestCase):
             self.assertEqual(repeated, solved)
 
     def test_checkpoint_discovery_reports_validation_and_progress(self):
-        root = (
-            PROJECT_ROOT
-            / "models"
-            / "artifacts"
-            / "ppo"
-            / "depth_1_10_onehot"
-        )
+        root = PROJECT_ROOT / "models" / "artifacts" / "ppo" / "depth_1_10_onehot"
         if not root.exists():
             self.skipTest("local depth-1–10 artifact is not available")
         found = discover_checkpoints(root)

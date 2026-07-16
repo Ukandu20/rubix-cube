@@ -6,7 +6,6 @@ from html import escape
 
 from cube.state import CubeState
 
-
 STICKER_COLORS = {
     "Y": "#facc15",
     "O": "#f97316",
@@ -59,7 +58,5 @@ def cube_net_html(state: str) -> str:
         ".cube-sticker{display:block;border-radius:3px;border:1px solid #0004}"
         "@media(max-width:650px){.cube-net{transform:scale(.75);"
         "transform-origin:top center;margin-bottom:-80px}}"
-        "</style><div class=\"cube-net\">"
-        + "".join(face_html)
-        + "</div>"
+        '</style><div class="cube-net">' + "".join(face_html) + "</div>"
     )

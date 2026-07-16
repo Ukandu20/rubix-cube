@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
 
 from showcase.service import (  # noqa: E402
     BenchmarkResult,
@@ -31,7 +26,6 @@ from showcase.service import (  # noqa: E402
     solve_result_record,
 )
 from showcase.visualization import cube_net_html  # noqa: E402
-
 
 ARTIFACT_ROOT = PROJECT_ROOT / "models" / "artifacts"
 CURRICULUM_PATH = PROJECT_ROOT / "config" / "curriculum_config_depth_1_10.yaml"
@@ -72,17 +66,22 @@ def main() -> None:
     )
     _initialize_state()
 
-    fingerprint = tuple(
-        (path.as_posix(), path.stat().st_mtime_ns)
-        for path in ARTIFACT_ROOT.rglob("*")
-        if path.name in {
-            "best_model.pt",
-            "final_model.pt",
-            "best_model.zip",
-            "final_model.zip",
-            "curriculum_progress.json",
-        }
-    ) if ARTIFACT_ROOT.exists() else ()
+    fingerprint = (
+        tuple(
+            (path.as_posix(), path.stat().st_mtime_ns)
+            for path in ARTIFACT_ROOT.rglob("*")
+            if path.name
+            in {
+                "best_model.pt",
+                "final_model.pt",
+                "best_model.zip",
+                "final_model.zip",
+                "curriculum_progress.json",
+            }
+        )
+        if ARTIFACT_ROOT.exists()
+        else ()
+    )
     checkpoints = cached_checkpoint_discovery(str(ARTIFACT_ROOT), fingerprint)
     compatible = [checkpoint for checkpoint in checkpoints if checkpoint.compatible]
     if not compatible:
@@ -263,9 +262,7 @@ def _demo_result(
     checkpoint: CheckpointInfo,
 ) -> None:
     status = st.success if result.solved else st.error
-    status(
-        "Solved" if result.solved else f"Not solved: {result.termination_reason}"
-    )
+    status("Solved" if result.solved else f"Not solved: {result.termination_reason}")
     metric_columns = st.columns(5)
     metric_columns[0].metric("Scramble length", result.scramble_length)
     metric_columns[1].metric("Attempts", result.attempts_used)
@@ -279,7 +276,9 @@ def _demo_result(
         f"{result.solver_seconds * 1000:.2f} ms",
     )
     if result.scramble_length > checkpoint.validated_depth:
-        st.warning("This result is outside the checkpoint's validated curriculum depth.")
+        st.warning(
+            "This result is outside the checkpoint's validated curriculum depth."
+        )
 
     st.markdown(f"**Scramble:** `{result.scramble}`")
     attempt = result.display_attempt

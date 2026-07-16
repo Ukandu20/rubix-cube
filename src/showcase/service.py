@@ -7,10 +7,11 @@ import io
 import json
 import math
 import random
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Literal, Mapping, Protocol, Sequence
+from typing import Literal, Protocol
 
 import numpy as np
 import torch
@@ -27,7 +28,6 @@ from cube.environment import ACTION_TO_MOVE, CubeEnvironment
 from cube.moves import apply_move
 from cube.notation import inverse_algorithm
 from cube.state import CubeState
-
 
 ScrambleMode = Literal["exact", "range", "curriculum"]
 TerminationReason = Literal[
@@ -273,7 +273,9 @@ def load_policy(path: Path | str) -> Policy:
         try:
             from stable_baselines3 import PPO
         except ImportError as exc:  # pragma: no cover - optional install state
-            raise ImportError("Loading SB3 checkpoints requires stable-baselines3") from exc
+            raise ImportError(
+                "Loading SB3 checkpoints requires stable-baselines3"
+            ) from exc
         return SB3Policy(PPO.load(checkpoint_path, device="cpu"))
     raise ValueError(f"unsupported PPO checkpoint format: {checkpoint_path.suffix}")
 
@@ -370,8 +372,7 @@ def _inspect_sb3_checkpoint(path: Path, root: Path) -> CheckpointInfo:
             raise ValueError("missing Stable-Baselines3 checkpoint metadata")
         timesteps = int(metadata.get("timesteps", 0))
         evaluated = [
-            int(depth)
-            for depth in metadata.get("evaluation", {}).get("by_depth", {})
+            int(depth) for depth in metadata.get("evaluation", {}).get("by_depth", {})
         ]
         validated_depth = max(evaluated, default=0)
         checkpoint_depth = int(
@@ -382,11 +383,16 @@ def _inspect_sb3_checkpoint(path: Path, root: Path) -> CheckpointInfo:
         compatible = False
         error = str(exc)
     return CheckpointInfo(
-        path=path.resolve(), label=path.relative_to(root).as_posix(),
-        compatible=compatible, error=error, validated_depth=validated_depth,
+        path=path.resolve(),
+        label=path.relative_to(root).as_posix(),
+        compatible=compatible,
+        error=error,
+        validated_depth=validated_depth,
         checkpoint_curriculum_depth=checkpoint_depth,
-        run_curriculum_depth=run_depth, observation_encoding="one_hot",
-        timesteps=timesteps, trainer="stable_baselines3",
+        run_curriculum_depth=run_depth,
+        observation_encoding="one_hot",
+        timesteps=timesteps,
+        trainer="stable_baselines3",
     )
 
 
@@ -449,7 +455,7 @@ def sample_scramble(
         ]
         if not filtered:
             raise ValueError("selected range has no curriculum sampling weight")
-        lengths, weights = zip(*filtered)
+        lengths, weights = zip(*filtered, strict=True)
         length = rng.choices(lengths, weights=weights, k=1)[0]
     else:
         raise ValueError(f"unknown scramble mode: {mode}")
@@ -713,9 +719,7 @@ def _summarize_benchmark(
                     / len(rows)
                 ),
                 "average_solver_ms": (
-                    1000
-                    * sum(float(row["solver_seconds"]) for row in rows)
-                    / len(rows)
+                    1000 * sum(float(row["solver_seconds"]) for row in rows) / len(rows)
                 ),
                 "oracle_length": length,
                 "oracle_solve_rate": _mean_bool(rows, "oracle_solved"),
