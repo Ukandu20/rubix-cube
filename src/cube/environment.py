@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 import random
-import sys
-from pathlib import Path
-from typing import Dict, Optional
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
+from cube.episode import RewardConfig, advance_episode
 from cube.moves import apply_move
 from cube.notation import generate_scramble
 from cube.state import CubeState
 
-
-ACTION_TO_MOVE: Dict[int, str] = {
+ACTION_TO_MOVE: dict[int, str] = {
     0: "U",
     1: "U'",
     2: "R",
@@ -29,7 +23,9 @@ ACTION_TO_MOVE: Dict[int, str] = {
     10: "B",
     11: "B'",
 }
-MOVE_TO_ACTION: Dict[str, int] = {move: action for action, move in ACTION_TO_MOVE.items()}
+MOVE_TO_ACTION: dict[str, int] = {
+    move: action for action, move in ACTION_TO_MOVE.items()
+}
 ACTION_SIZE = len(ACTION_TO_MOVE)
 DEFAULT_MAX_STEPS = 30
 
@@ -40,7 +36,7 @@ class CubeEnvironment:
     def __init__(
         self,
         max_steps: int = DEFAULT_MAX_STEPS,
-        rng: Optional[random.Random] = None,
+        rng: random.Random | None = None,
     ) -> None:
         if max_steps <= 0:
             raise ValueError("max_steps must be positive")
@@ -67,24 +63,28 @@ class CubeEnvironment:
     def step(self, action: int) -> tuple[str, float, bool, dict]:
         """Apply one discrete action and return next_state, reward, done, info."""
 
-        move = self._move_for_action(action)
-        self.cube = apply_move(self.cube, move)
-        self.move_count += 1
-        self.move_history.append(move)
-
-        solved = self.is_solved()
-        timeout = not solved and self.move_count >= self.max_steps
-        done = solved or timeout
-        reward = 1.0 if solved else -0.01
+        self._move_for_action(action)
+        transition = advance_episode(
+            self.cube,
+            action,
+            action_to_move=ACTION_TO_MOVE,
+            step_count=self.move_count,
+            max_steps=self.max_steps,
+            reward_config=RewardConfig(),
+        )
+        self.cube = transition.cube
+        self.move_count = transition.step_count
+        self.move_history.append(transition.move)
+        done = transition.solved or transition.timed_out
         info = {
-            "move": move,
+            "move": transition.move,
             "move_count": self.move_count,
             "max_steps": self.max_steps,
-            "is_solved": solved,
+            "is_solved": transition.solved,
             "scramble": self.scramble_sequence,
-            "timeout": timeout,
+            "timeout": transition.timed_out,
         }
-        return self.get_state(), reward, done, info
+        return self.get_state(), transition.reward, done, info
 
     def scramble(self, depth: int) -> str:
         """Reset to solved, apply a generated scramble, and start a new episode."""
@@ -138,7 +138,7 @@ class CubeEnvironment:
 
         return "\n".join(lines)
 
-    def copy(self) -> "CubeEnvironment":
+    def copy(self) -> CubeEnvironment:
         """Return an independent environment with the same episode state."""
 
         clone = CubeEnvironment(max_steps=self.max_steps, rng=self.rng)
@@ -149,7 +149,7 @@ class CubeEnvironment:
         clone.move_history = list(self.move_history)
         return clone
 
-    def clone(self) -> "CubeEnvironment":
+    def clone(self) -> CubeEnvironment:
         """Alias for copy, useful for search algorithms."""
 
         return self.copy()

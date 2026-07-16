@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping
-import warnings
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import yaml
 
-from cube.gym_environment import SOLVED_STATE_STRING, validate_encoded_state
+from cube.encoding import validate_encoded_state
+
+SOLVED_STATE_STRING = "YYYYYYYYYOOOOOOOOOGGGGGGGGGWWWWWWWWWRRRRRRRRRBBBBBBBBB"
 
 
 DEFAULT_CURRICULUM_CONFIG_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "config"
-    / "curriculum_config_depth_1_5.yaml"
+    Path(__file__).resolve().parents[2] / "config" / "curriculum_config_depth_1_5.yaml"
 )
 
 
@@ -117,8 +118,7 @@ def load_curriculum_config(
     raw_weights = values.get("mixed_sampling_weights", {})
     weights = {
         int(level): {
-            int(depth): float(weight)
-            for depth, weight in level_weights.items()
+            int(depth): float(weight) for depth, weight in level_weights.items()
         }
         for level, level_weights in raw_weights.items()
     }
@@ -185,15 +185,10 @@ class CurriculumManager:
                 raise ValueError(
                     "state_data must cover every configured curriculum depth"
                 )
-            self.depth_data = {
-                int(depth): frame
-                for depth, frame in state_data.items()
-            }
+            self.depth_data = {int(depth): frame for depth, frame in state_data.items()}
             if any(frame.empty for frame in self.depth_data.values()):
                 raise ValueError("state_data cannot contain an empty depth frame")
-        self._next_state_index_by_depth = {
-            depth: 0 for depth in self.depth_data
-        }
+        self._next_state_index_by_depth = {depth: 0 for depth in self.depth_data}
         self._rng = np.random.default_rng(seed)
         self.events: list[dict[str, Any]] = []
 
@@ -201,6 +196,56 @@ class CurriculumManager:
         """Reset the manager's random generator without resetting cycle positions."""
 
         self._rng = np.random.default_rng(seed)
+
+    def reset_depth_cursor(self, depth: int) -> None:
+        """Restart exhaustive sampling for one configured depth."""
+
+        selected_depth = int(depth)
+        if selected_depth not in self.depth_data:
+            raise ValueError(
+                f"No precomputed states available for depth {selected_depth}."
+            )
+        self._next_state_index_by_depth[selected_depth] = 0
+
+    def replace_depth_data(self, depth: int, frame: pd.DataFrame) -> None:
+        """Replace a depth dataset and reset its sampling cursor safely."""
+
+        selected_depth = int(depth)
+        if selected_depth not in self.depth_data:
+            raise ValueError(
+                f"No precomputed states available for depth {selected_depth}."
+            )
+        if frame.empty:
+            raise ValueError(f"depth {selected_depth} data cannot be empty")
+        if self.state_column not in frame.columns:
+            raise ValueError(
+                f"depth {selected_depth} data is missing {self.state_column!r}"
+            )
+        self.depth_data[selected_depth] = frame.reset_index(drop=True).copy()
+        self.reset_depth_cursor(selected_depth)
+
+    def exclude_states(
+        self,
+        states_by_depth: Mapping[int, set[str] | list[str] | tuple[str, ...]],
+    ) -> None:
+        """Remove held-out states while keeping sampling state consistent."""
+
+        for raw_depth, excluded_values in states_by_depth.items():
+            depth = int(raw_depth)
+            if depth not in self.depth_data:
+                continue
+            excluded = {str(value).strip() for value in excluded_values}
+            if not excluded:
+                continue
+            frame = self.depth_data[depth]
+            retained = frame.loc[
+                ~frame[self.state_column].astype(str).str.strip().isin(excluded)
+            ]
+            if retained.empty:
+                raise ValueError(
+                    f"excluding held-out states leaves depth {depth} empty"
+                )
+            self.replace_depth_data(depth, retained)
 
     def sample_state(
         self,
@@ -217,11 +262,14 @@ class CurriculumManager:
             )
         frame = self.depth_data[selected_depth]
 
-        if state_index is None and self.state_selection_mode(selected_depth) == "exhaustive_cycle":
+        if (
+            state_index is None
+            and self.state_selection_mode(selected_depth) == "exhaustive_cycle"
+        ):
             state_index = self._next_state_index_by_depth[selected_depth]
-            self._next_state_index_by_depth[selected_depth] = (
-                state_index + 1
-            ) % len(frame)
+            self._next_state_index_by_depth[selected_depth] = (state_index + 1) % len(
+                frame
+            )
         elif state_index is None:
             state_index = int(self._rng.integers(0, len(frame)))
 
@@ -291,7 +339,9 @@ class CurriculumManager:
         )
         if average_moves is None:
             return False
-        success_rate = float(metrics.get("solve_rate", metrics.get("success_rate", 0.0)))
+        success_rate = float(
+            metrics.get("solve_rate", metrics.get("success_rate", 0.0))
+        )
         timeout_rate = float(metrics.get("timeout_rate", 1.0))
         target = self.config.advancement_thresholds[self.current_depth]
         return (
@@ -321,9 +371,7 @@ class CurriculumManager:
             "sampling_strategy": self.config.sampling_strategy,
             "current_weights": self.current_weights(),
             "events": list(self.events),
-            "cross_depth_duplicates_removed": dict(
-                self.cross_depth_duplicates_removed
-            ),
+            "cross_depth_duplicates_removed": dict(self.cross_depth_duplicates_removed),
             "solved_states_removed": dict(self.solved_states_removed),
         }
 
@@ -346,9 +394,7 @@ class CurriculumManager:
             frame = frame.reset_index(drop=True)
             if frame.empty:
                 raise ValueError(f"Depth {depth} file contains no states: {path}")
-            states = [
-                str(value).strip() for value in frame[self.state_column]
-            ]
+            states = [str(value).strip() for value in frame[self.state_column]]
             if validate_dataset:
                 if any(not validate_encoded_state(state) for state in states):
                     raise ValueError(
@@ -362,10 +408,7 @@ class CurriculumManager:
                 removed_count = int(cross_depth_mask.sum())
                 if removed_count:
                     frame = frame.loc[~cross_depth_mask].reset_index(drop=True)
-                    states = [
-                        str(value).strip()
-                        for value in frame[self.state_column]
-                    ]
+                    states = [str(value).strip() for value in frame[self.state_column]]
                     self.cross_depth_duplicates_removed[depth] = removed_count
                     if self.warn_on_normalization:
                         warnings.warn(
@@ -380,16 +423,11 @@ class CurriculumManager:
                             f"Depth {depth} contains no states after removing "
                             "states already available at shallower depths"
                         )
-                solved_mask = pd.Series(states).eq(
-                    SOLVED_STATE_STRING
-                ).to_numpy()
+                solved_mask = pd.Series(states).eq(SOLVED_STATE_STRING).to_numpy()
                 solved_count = int(solved_mask.sum())
                 if solved_count:
                     frame = frame.loc[~solved_mask].reset_index(drop=True)
-                    states = [
-                        str(value).strip()
-                        for value in frame[self.state_column]
-                    ]
+                    states = [str(value).strip() for value in frame[self.state_column]]
                     self.solved_states_removed[depth] = solved_count
                     if self.warn_on_normalization:
                         warnings.warn(
@@ -400,9 +438,7 @@ class CurriculumManager:
                             stacklevel=2,
                         )
                     if frame.empty:
-                        raise ValueError(
-                            f"Depth {depth} contains no unsolved states"
-                        )
+                        raise ValueError(f"Depth {depth} contains no unsolved states")
             seen_states.update(states)
             depth_data[depth] = frame
         return depth_data

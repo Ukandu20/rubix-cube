@@ -1,5 +1,4 @@
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,9 +6,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from agents.ppo_agent import (  # noqa: E402
     NetworkConfig,
@@ -29,6 +26,32 @@ from curriculum.manager import (  # noqa: E402
 
 
 class CurriculumManagerTests(unittest.TestCase):
+    def test_public_dataset_methods_keep_sampling_cursor_consistent(self):
+        first = _row_for_moves("R")
+        second = _row_for_moves("U")
+        frame = pd.DataFrame([first, second])
+        manager = CurriculumManager(
+            {1: "unused.csv"},
+            _config(),
+            state_data={1: frame},
+        )
+
+        _, sampled = manager.sample_state(depth=1)
+        self.assertEqual(sampled["state_encoded"], first["state_encoded"])
+
+        manager.reset_depth_cursor(1)
+        _, sampled_again = manager.sample_state(depth=1)
+        self.assertEqual(sampled_again["state_encoded"], first["state_encoded"])
+
+        manager.exclude_states({1: [first["state_encoded"]]})
+        self.assertEqual(len(manager.depth_data[1]), 1)
+        _, retained = manager.sample_state(depth=1)
+        self.assertEqual(retained["state_encoded"], second["state_encoded"])
+
+        manager.replace_depth_data(1, frame)
+        _, replaced_first = manager.sample_state(depth=1)
+        self.assertEqual(replaced_first["state_encoded"], first["state_encoded"])
+
     def test_cross_depth_duplicates_are_kept_only_at_shallowest_depth(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -129,12 +152,10 @@ class CurriculumManagerTests(unittest.TestCase):
             )
 
             depth_1_ids = [
-                manager.sample_state(depth=1)[1]["sample_id"]
-                for _ in range(3)
+                manager.sample_state(depth=1)[1]["sample_id"] for _ in range(3)
             ]
             depth_2_ids = [
-                manager.sample_state(depth=2)[1]["sample_id"]
-                for _ in range(3)
+                manager.sample_state(depth=2)[1]["sample_id"] for _ in range(3)
             ]
 
             threshold_files = {
@@ -251,9 +272,7 @@ class CurriculumManagerTests(unittest.TestCase):
                 (output_dir / "metrics.json").read_text(encoding="utf-8")
             )
             progress = json.loads(
-                (output_dir / "curriculum_progress.json").read_text(
-                    encoding="utf-8"
-                )
+                (output_dir / "curriculum_progress.json").read_text(encoding="utf-8")
             )
             best_checkpoint = load_checkpoint(
                 output_dir / "best_model.pt",
@@ -340,10 +359,7 @@ def _config(
     starting_depth: int = 1,
     weights: dict[int, dict[int, float]] | None = None,
 ) -> CurriculumConfig:
-    default_weights = {
-        depth: {depth: 1.0}
-        for depth in range(1, max_depth + 1)
-    }
+    default_weights = {depth: {depth: 1.0} for depth in range(1, max_depth + 1)}
     return CurriculumConfig(
         min_depth=1,
         max_depth=max_depth,

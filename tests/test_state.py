@@ -1,10 +1,5 @@
-import sys
 import unittest
 from collections import Counter
-from pathlib import Path
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cube.state import DEFAULT_COLORS, FACE_ORDER, CubeState
 
@@ -74,10 +69,7 @@ class CubeStateTests(unittest.TestCase):
 
     def assert_sticker_counts(self, cube, expected_count):
         counts = Counter(
-            sticker
-            for face in cube.faces.values()
-            for row in face
-            for sticker in row
+            sticker for face in cube.faces.values() for row in face for sticker in row
         )
         self.assertEqual(
             counts,

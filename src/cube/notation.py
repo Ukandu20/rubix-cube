@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import random
 import re
-from typing import Optional, Union
-
+from dataclasses import dataclass
 
 BASE_FACES = ("U", "R", "F", "D", "L", "B")
 _MOVE_PATTERN = re.compile(r"^([URFDLB])(w)?(2|')?$")
-_SCRAMBLE_MOVES = tuple(f"{face}{suffix}" for face in BASE_FACES for suffix in ("", "'"))
+_SCRAMBLE_MOVES = tuple(
+    f"{face}{suffix}" for face in BASE_FACES for suffix in ("", "'")
+)
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ class Move:
         if not isinstance(self.wide, bool):
             raise ValueError("move wide flag must be a boolean")
 
-    def inverse(self) -> "Move":
+    def inverse(self) -> Move:
         """Return the opposite quarter-turn."""
 
         return Move(self.face, -self.direction, self.wide)
@@ -45,7 +45,7 @@ class Move:
         return self.to_token()
 
 
-MoveInput = Union[str, Move]
+MoveInput = str | Move
 
 
 def parse_move(token: str) -> list[Move]:
@@ -131,8 +131,8 @@ def inverse_algorithm(algorithm: str) -> str:
 
 def generate_scramble(
     size: int = 3,
-    length: Optional[int] = None,
-    rng: Optional[random.Random] = None,
+    length: int | None = None,
+    rng: random.Random | None = None,
 ) -> str:
     """Generate an opt-in random face-turn scramble."""
 
@@ -145,7 +145,7 @@ def generate_scramble(
 
     random_source = rng if rng is not None else random
     tokens: list[str] = []
-    previous_token: Optional[str] = None
+    previous_token: str | None = None
 
     for _ in range(length):
         if previous_token is None:

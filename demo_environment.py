@@ -1,4 +1,4 @@
-from cube import CubeEnvironment, MOVE_TO_ACTION
+from cube import MOVE_TO_ACTION, CubeEnvironment
 
 env = CubeEnvironment()
 

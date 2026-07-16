@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Optional, Tuple, Union
+from collections.abc import Iterable
 
 from cube.notation import Move, parse_algorithm, parse_move
-from cube.state import CubeState, FACE_ORDER, Sticker
+from cube.state import FACE_ORDER, CubeState, Sticker
 
-
-Coordinate = Tuple[int, int, int]
-Normal = Tuple[int, int, int]
-MoveInput = Union[str, Move]
+Coordinate = tuple[int, int, int]
+Normal = tuple[int, int, int]
+MoveInput = str | Move
 
 
 _MOVE_LAYERS = {
@@ -59,7 +58,7 @@ def _apply_quarter_turn(cube: CubeState, move: Move) -> CubeState:
 
     size = cube.size
     source_faces = cube.faces
-    target_faces: dict[str, list[list[Optional[Sticker]]]] = {
+    target_faces: dict[str, list[list[Sticker | None]]] = {
         face_name: [[None for _ in range(size)] for _ in range(size)]
         for face_name in FACE_ORDER
     }
@@ -168,7 +167,7 @@ def _rotate_normal_positive(normal: Normal, axis: str) -> Normal:
     raise ValueError(f"invalid rotation axis: {axis!r}")
 
 
-def _require_sticker(sticker: Optional[Sticker]) -> Sticker:
+def _require_sticker(sticker: Sticker | None) -> Sticker:
     if sticker is None:
         raise ValueError("move produced an incomplete cube state")
     return sticker

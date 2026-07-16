@@ -1,4 +1,3 @@
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,10 +6,7 @@ import gymnasium as gym
 import numpy as np
 import pandas as pd
 
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-import cube  # noqa: E402,F401
+import cube as cube_package  # noqa: E402,F401
 from cube.environment import MOVE_TO_ACTION
 from cube.gym_environment import (
     DEFAULT_EXHAUSTIVE_STATE_THRESHOLD,
@@ -92,8 +88,7 @@ class RubixCubeSolveEnvTests(unittest.TestCase):
             threshold_path = _write_depth_csv(
                 directory,
                 2,
-                [_row_for_move("U R", depth=2)]
-                * DEFAULT_EXHAUSTIVE_STATE_THRESHOLD,
+                [_row_for_move("U R", depth=2)] * DEFAULT_EXHAUSTIVE_STATE_THRESHOLD,
             )
             env = RubixCubeSolveEnv(
                 state_files={1: small_path, 2: threshold_path},

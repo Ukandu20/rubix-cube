@@ -1,14 +1,8 @@
-import sys
 import unittest
-from pathlib import Path
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cube.moves import apply_algorithm, apply_move, apply_moves
 from cube.notation import Move, inverse_algorithm
 from cube.state import CubeState
-
 
 BASE_MOVES = ("U", "R", "F", "D", "L", "B")
 

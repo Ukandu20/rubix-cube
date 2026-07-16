@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import Dict, Mapping, Optional, Sequence, Tuple
-
+from collections.abc import Mapping, Sequence
 
 FaceName = str
 Sticker = str
-Face = Tuple[Tuple[Sticker, ...], ...]
-Faces = Dict[FaceName, Face]
+Face = tuple[tuple[Sticker, ...], ...]
+Faces = dict[FaceName, Face]
 
-FACE_ORDER: Tuple[FaceName, ...] = ("U", "R", "F", "D", "L", "B")
+FACE_ORDER: tuple[FaceName, ...] = ("U", "R", "F", "D", "L", "B")
 DEFAULT_COLORS: Mapping[FaceName, Sticker] = {
     "U": "Y",
     "R": "O",
@@ -31,7 +30,7 @@ class CubeState:
     def __init__(
         self,
         size: int = 3,
-        faces: Optional[Mapping[FaceName, Sequence[Sequence[Sticker]]]] = None,
+        faces: Mapping[FaceName, Sequence[Sequence[Sticker]]] | None = None,
     ) -> None:
         self._validate_size(size)
         normalized_faces = (
@@ -42,7 +41,7 @@ class CubeState:
         self._faces = normalized_faces
 
     @classmethod
-    def solved(cls, size: int = CUBE_SIZE) -> "CubeState":
+    def solved(cls, size: int = CUBE_SIZE) -> CubeState:
         """Create a solved 3x3 cube."""
 
         return cls(size=size)
@@ -50,14 +49,14 @@ class CubeState:
     @classmethod
     def from_faces(
         cls, faces: Mapping[FaceName, Sequence[Sequence[Sticker]]]
-    ) -> "CubeState":
+    ) -> CubeState:
         """Create a cube by inferring size from the supplied face grids."""
 
         size = cls._infer_size(faces)
         return cls(size=size, faces=faces)
 
     @classmethod
-    def from_flat_string(cls, value: str, size: int) -> "CubeState":
+    def from_flat_string(cls, value: str, size: int) -> CubeState:
         """Create a cube from stickers ordered by U, R, F, D, L, B faces."""
 
         cls._validate_size(size)
@@ -71,7 +70,7 @@ class CubeState:
                 f"for a {size}x{size} cube"
             )
 
-        faces: Dict[FaceName, Tuple[Tuple[Sticker, ...], ...]] = {}
+        faces: dict[FaceName, tuple[tuple[Sticker, ...], ...]] = {}
         cursor = 0
         for face_name in FACE_ORDER:
             rows = []
@@ -88,7 +87,7 @@ class CubeState:
         return self._size
 
     @property
-    def faces(self) -> Dict[FaceName, list[list[Sticker]]]:
+    def faces(self) -> dict[FaceName, list[list[Sticker]]]:
         """Return a defensive copy of the cube faces."""
 
         return {
@@ -105,11 +104,15 @@ class CubeState:
         """Return whether each face contains only its solved color."""
 
         return all(
-            all(sticker == DEFAULT_COLORS[face_name] for row in self._faces[face_name] for sticker in row)
+            all(
+                sticker == DEFAULT_COLORS[face_name]
+                for row in self._faces[face_name]
+                for sticker in row
+            )
             for face_name in FACE_ORDER
         )
 
-    def copy(self) -> "CubeState":
+    def copy(self) -> CubeState:
         """Return an equal, independent cube state."""
 
         return CubeState(size=self._size, faces=self._faces)
@@ -158,7 +161,9 @@ class CubeState:
             raise ValueError(f"unknown cube face(s): {', '.join(extra)}")
 
         return {
-            face_name: tuple(tuple(sticker for sticker in row) for row in faces[face_name])
+            face_name: tuple(
+                tuple(sticker for sticker in row) for row in faces[face_name]
+            )
             for face_name in FACE_ORDER
         }
 
@@ -184,9 +189,7 @@ class CubeState:
         for face_name in FACE_ORDER:
             face = faces[face_name]
             if len(face) != size:
-                raise ValueError(
-                    f"face {face_name} must contain exactly {size} rows"
-                )
+                raise ValueError(f"face {face_name} must contain exactly {size} rows")
             for row in face:
                 if len(row) != size:
                     raise ValueError(

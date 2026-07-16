@@ -1,10 +1,5 @@
 import random
-import sys
 import unittest
-from pathlib import Path
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cube.environment import (
     ACTION_SIZE,
@@ -52,9 +47,8 @@ class CubeEnvironmentTests(unittest.TestCase):
         env = CubeEnvironment()
 
         for action in (-1, ACTION_SIZE, "R"):
-            with self.subTest(action=action):
-                with self.assertRaises(ValueError):
-                    env.step(action)
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                env.step(action)
 
     def test_inverse_action_solves_cube_and_rewards_success(self):
         env = CubeEnvironment()
@@ -145,6 +139,7 @@ class CubeEnvironmentTests(unittest.TestCase):
         self.assertEqual(ACTION_TO_MOVE[0], "U")
         self.assertEqual(ACTION_TO_MOVE[11], "B'")
         self.assertEqual(MOVE_TO_ACTION["F'"], 5)
+
 
 def _rendered_face_color(face_name: str) -> str:
     return " ".join(DEFAULT_COLORS[face_name] for _ in range(3))

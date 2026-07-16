@@ -1,10 +1,5 @@
 import random
-import sys
 import unittest
-from pathlib import Path
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cube.notation import (
     Move,
@@ -103,7 +98,7 @@ class MoveNotationTests(unittest.TestCase):
         self.assertEqual(len(tokens), 25)
         self.assertTrue(all(is_valid_move(token) for token in tokens))
         self.assertTrue(all("2" not in token for token in tokens))
-        for current_token, next_token in zip(tokens, tokens[1:]):
+        for current_token, next_token in zip(tokens, tokens[1:], strict=False):
             inverse_token = inverse_move(current_token)[0].to_token()
             self.assertNotEqual(next_token, inverse_token)
 

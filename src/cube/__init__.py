@@ -1,17 +1,24 @@
 """Cube package public API."""
 
-from cube.environment import ACTION_SIZE, ACTION_TO_MOVE, MOVE_TO_ACTION, CubeEnvironment
-from cube.gym_environment import (
+from cube.encoding import (
     COLOR_TO_INT,
-    ENV_ID,
     INT_TO_COLOR,
+    decode_state,
+    encode_state,
+    validate_encoded_state,
+)
+from cube.environment import (
+    ACTION_SIZE,
+    ACTION_TO_MOVE,
+    MOVE_TO_ACTION,
+    CubeEnvironment,
+)
+from cube.gym_environment import (
+    ENV_ID,
     INVERSE_ACTION,
     SOLVED_STATE_STRING,
     RubixCubeSolveEnv,
-    decode_state,
-    encode_state,
     register_gym_environment,
-    validate_encoded_state,
 )
 from cube.moves import apply_algorithm, apply_move, apply_moves
 from cube.notation import (

@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
-import sys
-from typing import Any, Mapping
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from typing import Any
 
 import gymnasium as gym
 import numpy as np
@@ -16,30 +12,24 @@ import pandas as pd
 from gymnasium import spaces
 from gymnasium.envs.registration import register, registry
 
+from cube.encoding import (
+    STICKER_COUNT,
+    decode_state,
+    encode_state,
+    validate_encoded_state,
+)
 from cube.environment import ACTION_TO_MOVE
-from cube.moves import apply_move
+from cube.episode import RewardConfig, advance_episode
 from cube.state import CubeState
-
 
 ENV_ID = "RubixCubeSolve-v0"
 SOLVED_STATE_STRING = "YYYYYYYYYOOOOOOOOOGGGGGGGGGWWWWWWWWWRRRRRRRRRBBBBBBBBB"
-STICKER_COUNT = 54
 DEFAULT_MAX_EPISODE_STEPS = 50
 DEFAULT_EXHAUSTIVE_STATE_THRESHOLD = 10000
 DEFAULT_TRAINING_DATA_DIR = Path("data/processed/training/parquet")
 DEFAULT_STATE_FILES = {
-    depth: DEFAULT_TRAINING_DATA_DIR / f"depth_{depth}.parquet"
-    for depth in range(1, 6)
+    depth: DEFAULT_TRAINING_DATA_DIR / f"depth_{depth}.parquet" for depth in range(1, 6)
 }
-COLOR_TO_INT = {
-    "Y": 0,
-    "O": 1,
-    "G": 2,
-    "W": 3,
-    "R": 4,
-    "B": 5,
-}
-INT_TO_COLOR = {value: key for key, value in COLOR_TO_INT.items()}
 INVERSE_ACTION = {
     0: 1,
     1: 0,
@@ -92,10 +82,7 @@ class RubixCubeSolveEnv(gym.Env):
             raise ValueError("max_episode_steps must be positive")
         if render_mode not in (None, "text", "human"):
             raise ValueError("render_mode must be one of None, 'text', or 'human'")
-        if (
-            exhaustive_state_threshold is not None
-            and exhaustive_state_threshold <= 0
-        ):
+        if exhaustive_state_threshold is not None and exhaustive_state_threshold <= 0:
             raise ValueError("exhaustive_state_threshold must be positive")
 
         configured_state_files = state_files
@@ -148,9 +135,7 @@ class RubixCubeSolveEnv(gym.Env):
         else:
             self.states_by_depth = self._load_state_files(validate_dataset)
         self._validate_depth_configuration()
-        self._next_state_index_by_depth = {
-            depth: 0 for depth in self.states_by_depth
-        }
+        self._next_state_index_by_depth = {depth: 0 for depth in self.states_by_depth}
 
         self.cube = CubeState.solved()
         self.cube_state = self.solved_state.copy()
@@ -195,8 +180,8 @@ class RubixCubeSolveEnv(gym.Env):
                 depth=requested_depth,
                 state_index=state_index,
             )
-            self.episode_max_steps = (
-                self.curriculum_manager.config.max_episode_steps(curriculum_depth)
+            self.episode_max_steps = self.curriculum_manager.config.max_episode_steps(
+                curriculum_depth
             )
         else:
             self.current_depth = self._select_depth(options)
@@ -235,7 +220,9 @@ class RubixCubeSolveEnv(gym.Env):
         }
         return self.get_observation(), info
 
-    def exclude_states(self, states_by_depth: Mapping[int, set[str] | list[str]]) -> None:
+    def exclude_states(
+        self, states_by_depth: Mapping[int, set[str] | list[str]]
+    ) -> None:
         """Remove held-out encoded states before training or evaluation resets."""
 
         for raw_depth, excluded_values in states_by_depth.items():
@@ -255,52 +242,47 @@ class RubixCubeSolveEnv(gym.Env):
                 )
             self.states_by_depth[depth] = retained
             if self.curriculum_manager is not None:
-                self.curriculum_manager.depth_data[depth] = retained
-                self.curriculum_manager._next_state_index_by_depth[depth] = 0
+                self.curriculum_manager.replace_depth_data(depth, retained)
             self._next_state_index_by_depth[depth] = 0
 
-    def step(
-        self, action: int
-    ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         """Apply one cube move and return the Gymnasium step tuple."""
 
         if not self.action_space.contains(action):
             raise ValueError(f"Invalid action: {action}")
 
         action = int(action)
-        immediate_inverse = (
-            self.last_action is not None
-            and action == INVERSE_ACTION[self.last_action]
+        transition = advance_episode(
+            self.cube,
+            action,
+            action_to_move=ACTION_TO_MOVE,
+            step_count=self.current_step,
+            max_steps=self.episode_max_steps,
+            previous_action=self.last_action,
+            inverse_action=INVERSE_ACTION,
+            reward_config=RewardConfig.from_mapping(self.reward_config),
         )
-        move = ACTION_TO_MOVE[action]
-        self.cube = apply_move(self.cube, move)
+        self.cube = transition.cube
         self.cube_state = decode_state(self.cube.to_flat_string())
-        self.current_step += 1
+        self.current_step = transition.step_count
         self.move_history.append(action)
 
-        solved = self.is_solved()
-        reward = self.calculate_reward(
-            solved=solved,
-            immediate_inverse=immediate_inverse,
-        )
-        terminated = solved
-        truncated = self.current_step >= self.episode_max_steps and not solved
-        if truncated:
-            reward += self.timeout_penalty
+        terminated = transition.solved
+        truncated = transition.timed_out
 
         self.last_action = action
-        self.last_move = move
-        self.episode_return += reward
+        self.last_move = transition.move
+        self.episode_return += transition.reward
 
         info = {
-            "is_solved": solved,
+            "is_solved": transition.solved,
             "start_depth": self.current_depth,
             "sampled_depth": self.current_depth,
             "current_step": self.current_step,
             "max_episode_steps": self.episode_max_steps,
             "last_action": action,
-            "last_move": move,
-            "immediate_inverse_move": immediate_inverse,
+            "last_move": transition.move,
+            "immediate_inverse_move": transition.immediate_inverse,
             "move_history": self.move_history.copy(),
             "move_history_notation": [
                 ACTION_TO_MOVE[action_id] for action_id in self.move_history
@@ -315,7 +297,7 @@ class RubixCubeSolveEnv(gym.Env):
             ),
             **self.episode_start_info,
         }
-        return self.get_observation(), reward, terminated, truncated, info
+        return self.get_observation(), transition.reward, terminated, truncated, info
 
     def sample_state_from_depth(
         self,
@@ -524,45 +506,6 @@ class RubixCubeSolveEnv(gym.Env):
             if face_index != 5:
                 lines.append("")
         return "\n".join(lines)
-
-
-def decode_state(encoded_state: str) -> np.ndarray:
-    """Decode a 54-character cube state string into integer sticker IDs."""
-
-    encoded_state = encoded_state.strip()
-    if not validate_encoded_state(encoded_state):
-        raise ValueError("encoded_state must be a valid 54-sticker cube string")
-    return np.array(
-        [COLOR_TO_INT[color] for color in encoded_state],
-        dtype=np.int8,
-    )
-
-
-def encode_state(decoded_state: np.ndarray) -> str:
-    """Encode integer sticker IDs into a 54-character cube state string."""
-
-    values = np.asarray(decoded_state).reshape(-1)
-    if len(values) != STICKER_COUNT:
-        raise ValueError(f"decoded_state must contain {STICKER_COUNT} stickers")
-
-    invalid_values = set(int(value) for value in values) - set(INT_TO_COLOR)
-    if invalid_values:
-        raise ValueError(f"invalid sticker values: {invalid_values}")
-
-    return "".join(INT_TO_COLOR[int(value)] for value in values)
-
-
-def validate_encoded_state(encoded_state: str) -> bool:
-    """Return whether an encoded state is structurally valid."""
-
-    encoded_state = encoded_state.strip()
-    if len(encoded_state) != STICKER_COUNT:
-        return False
-    if set(encoded_state) - set(COLOR_TO_INT):
-        return False
-
-    counts = Counter(encoded_state)
-    return all(counts[color] == 9 for color in COLOR_TO_INT)
 
 
 def _read_state_file(path: Path) -> pd.DataFrame:
