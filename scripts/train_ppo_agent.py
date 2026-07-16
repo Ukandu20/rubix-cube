@@ -4,24 +4,17 @@ from __future__ import annotations
 
 import argparse
 import re
-import sys
 from pathlib import Path
 from typing import Any
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
 
 from agents.ppo_agent import (  # noqa: E402
     DEFAULT_EVAL_EPISODES,
     DEFAULT_EVAL_FREQUENCY,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_TOTAL_TIMESTEPS,
-    NetworkConfig,
     OBSERVATION_SIZE,
     ONE_HOT_OBSERVATION_SIZE,
+    NetworkConfig,
     PPOConfig,
     train_ppo,
 )
@@ -48,7 +41,9 @@ def main() -> None:
     )
     parser.add_argument("--min-depth", type=int, default=1)
     parser.add_argument("--max-depth", type=int, default=5)
-    parser.add_argument("--max-episode-steps", type=int, default=DEFAULT_MAX_EPISODE_STEPS)
+    parser.add_argument(
+        "--max-episode-steps", type=int, default=DEFAULT_MAX_EPISODE_STEPS
+    )
     parser.add_argument("--total-timesteps", type=int, default=DEFAULT_TOTAL_TIMESTEPS)
     parser.add_argument("--eval-frequency", type=int, default=DEFAULT_EVAL_FREQUENCY)
     parser.add_argument(
@@ -119,19 +114,13 @@ def main() -> None:
         observation_encoding=args.observation_encoding,
     )
     curriculum_config = (
-        None
-        if args.no_curriculum
-        else load_curriculum_config(args.curriculum_config)
+        None if args.no_curriculum else load_curriculum_config(args.curriculum_config)
     )
     training_min_depth = (
-        curriculum_config.min_depth
-        if curriculum_config is not None
-        else args.min_depth
+        curriculum_config.min_depth if curriculum_config is not None else args.min_depth
     )
     training_max_depth = (
-        curriculum_config.max_depth
-        if curriculum_config is not None
-        else args.max_depth
+        curriculum_config.max_depth if curriculum_config is not None else args.max_depth
     )
     output_dir, output_metadata = resolve_training_output_dir(
         output_dir=args.output_dir,

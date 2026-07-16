@@ -1,12 +1,7 @@
 import csv
 import random
-import sys
 import tempfile
 import unittest
-from pathlib import Path
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cube.moves import apply_algorithm
 from cube.notation import inverse_move, split_algorithm
@@ -29,7 +24,9 @@ class TrainingDataTests(unittest.TestCase):
         self.assertEqual(example.sample_id, "sample-1")
         self.assertEqual(example.scramble_depth, 2)
         self.assertEqual(len(example.state_encoded), 54)
-        self.assertEqual(example.first_solution_move, split_algorithm(example.solution_moves)[0])
+        self.assertEqual(
+            example.first_solution_move, split_algorithm(example.solution_moves)[0]
+        )
         self.assertFalse(example.is_solved)
 
     def test_solution_moves_solve_generated_state(self):
@@ -44,7 +41,7 @@ class TrainingDataTests(unittest.TestCase):
         moves = split_algorithm(example.scramble_moves)
 
         self.assertEqual(len(moves), 5)
-        for current_move, next_move in zip(moves, moves[1:]):
+        for current_move, next_move in zip(moves, moves[1:], strict=False):
             inverse_token = inverse_move(current_move)[0].to_token()
             self.assertNotEqual(next_move, inverse_token)
 
@@ -96,7 +93,9 @@ class TrainingDataTests(unittest.TestCase):
                 unique=True,
             )
 
-            self.assertEqual([path.name for path in paths], ["depth_1.csv", "depth_2.csv"])
+            self.assertEqual(
+                [path.name for path in paths], ["depth_1.csv", "depth_2.csv"]
+            )
             for path in paths:
                 self.assertTrue(path.exists())
 

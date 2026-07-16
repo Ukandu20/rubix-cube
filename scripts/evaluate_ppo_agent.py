@@ -4,14 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
 
 from agents.behavior_logging import (  # noqa: E402
     DEFAULT_BEHAVIOR_LOG_ROOT,
@@ -45,7 +38,9 @@ def main() -> None:
             "evaluated once per unique state."
         ),
     )
-    parser.add_argument("--max-episode-steps", type=int, default=DEFAULT_MAX_EPISODE_STEPS)
+    parser.add_argument(
+        "--max-episode-steps", type=int, default=DEFAULT_MAX_EPISODE_STEPS
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--json", type=Path, default=None)
     parser.add_argument("--log-behavior", action="store_true")
@@ -90,7 +85,9 @@ def main() -> None:
                 print(f"Wrote {kind}: {path}")
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
-        args.json.write_text(json.dumps(results, indent=2, sort_keys=True), encoding="utf-8")
+        args.json.write_text(
+            json.dumps(results, indent=2, sort_keys=True), encoding="utf-8"
+        )
         print(f"Wrote {args.json}")
 
 

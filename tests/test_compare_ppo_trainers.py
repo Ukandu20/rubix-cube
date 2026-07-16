@@ -1,13 +1,15 @@
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.compare_ppo_trainers import MATCHED_PPO_FIELDS, compare_runs, render_markdown
+from scripts.compare_ppo_trainers import (
+    MATCHED_PPO_FIELDS,
+    compare_runs,
+    render_markdown,
+)
 
 
 class ComparePPOTrainersTests(unittest.TestCase):

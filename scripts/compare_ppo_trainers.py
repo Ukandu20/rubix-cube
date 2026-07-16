@@ -5,9 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
-
+from typing import Any
 
 MATCHED_PPO_FIELDS = (
     "learning_rate",
@@ -29,7 +29,9 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _entropy(distribution: Mapping[str, Any]) -> float | None:
-    probabilities = [float(value) for value in distribution.values() if float(value) > 0]
+    probabilities = [
+        float(value) for value in distribution.values() if float(value) > 0
+    ]
     if not probabilities:
         return None
     return -sum(value * math.log(value) for value in probabilities)
@@ -78,10 +80,9 @@ def compare_runs(custom_dir: Path, sb3_dir: Path) -> dict[str, Any]:
         "curriculum": custom_config.get("curriculum") == sb3_config.get("curriculum"),
     }
     for field in MATCHED_PPO_FIELDS:
-        checks[f"ppo.{field}"] = (
-            custom_config.get("ppo", {}).get(field)
-            == sb3_config.get("ppo", {}).get(field)
-        )
+        checks[f"ppo.{field}"] = custom_config.get("ppo", {}).get(
+            field
+        ) == sb3_config.get("ppo", {}).get(field)
     deltas = {
         field: (
             None

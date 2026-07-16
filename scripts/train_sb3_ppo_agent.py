@@ -3,15 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from agents.sb3_ppo_agent import (  # noqa: E402
     DEFAULT_SB3_OUTPUT_DIR,
@@ -39,7 +31,9 @@ def main() -> None:
         type=Path,
         help="Resume an SB3 .zip checkpoint in the selected output directory.",
     )
-    parser.add_argument("--curriculum-config", type=Path, default=DEFAULT_CURRICULUM_CONFIG_PATH)
+    parser.add_argument(
+        "--curriculum-config", type=Path, default=DEFAULT_CURRICULUM_CONFIG_PATH
+    )
     parser.add_argument("--total-timesteps", type=int, default=500_000)
     parser.add_argument("--eval-frequency", type=int, default=10_000)
     parser.add_argument("--eval-episodes", type=int, default=100)
@@ -82,9 +76,7 @@ def main() -> None:
     parser.add_argument("--pretrain-early-stopping-patience", type=int, default=2)
     parser.add_argument("--pretrain-gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--pretrain-update-shared-encoder", action="store_true")
-    parser.add_argument(
-        "--pretrain-rollout-sample-per-depth", type=int, default=1_000
-    )
+    parser.add_argument("--pretrain-rollout-sample-per-depth", type=int, default=1_000)
     args = parser.parse_args()
 
     curriculum = load_curriculum_config(args.curriculum_config)
@@ -124,18 +116,30 @@ def main() -> None:
         experiment_suffix=experiment_suffix,
     )
     config = SB3PPOConfig(
-        learning_rate=args.learning_rate, gamma=args.gamma,
-        gae_lambda=args.gae_lambda, clip_range=args.clip_range,
-        n_epochs=args.n_epochs, n_steps=args.n_steps, batch_size=args.batch_size,
-        ent_coef=args.ent_coef, vf_coef=args.vf_coef,
-        max_grad_norm=args.max_grad_norm, target_kl=args.target_kl,
+        learning_rate=args.learning_rate,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_range=args.clip_range,
+        n_epochs=args.n_epochs,
+        n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        ent_coef=args.ent_coef,
+        vf_coef=args.vf_coef,
+        max_grad_norm=args.max_grad_norm,
+        target_kl=args.target_kl,
     )
     result = train_sb3_ppo(
-        curriculum_config=curriculum, total_timesteps=args.total_timesteps,
-        data_dir=args.data_dir, output_dir=output_dir, seed=args.seed,
-        device=args.device, eval_frequency=args.eval_frequency,
-        eval_episodes=args.eval_episodes, n_envs=args.n_envs,
-        subprocess=args.subprocess, config=config,
+        curriculum_config=curriculum,
+        total_timesteps=args.total_timesteps,
+        data_dir=args.data_dir,
+        output_dir=output_dir,
+        seed=args.seed,
+        device=args.device,
+        eval_frequency=args.eval_frequency,
+        eval_episodes=args.eval_episodes,
+        n_envs=args.n_envs,
+        subprocess=args.subprocess,
+        config=config,
         validate_dataset=not args.skip_dataset_validation,
         output_metadata=output_metadata,
         resume_from=args.resume_from,

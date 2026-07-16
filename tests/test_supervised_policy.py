@@ -1,14 +1,10 @@
 import csv
 import importlib.util
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import torch
 from torch import nn
@@ -90,7 +86,9 @@ class SupervisedPolicyTests(unittest.TestCase):
         self.assertFalse(hasattr(dataset, "features"))
         self.assertEqual(tuple(features.shape), (INPUT_SIZE,))
         self.assertEqual(tuple(dataset.labels.shape), (1,))
-        self.assertEqual(int(label.item()), LABEL_TO_INDEX[rows[0]["first_solution_move"]])
+        self.assertEqual(
+            int(label.item()), LABEL_TO_INDEX[rows[0]["first_solution_move"]]
+        )
         self.assertEqual(int(depth.item()), 1)
 
     def test_loader_filters_depth_range(self):
@@ -151,7 +149,9 @@ class SupervisedPolicyTests(unittest.TestCase):
         self.assertEqual([path.name for path in paths], ["depth_1.parquet"])
         self.assertEqual(len(loaded_rows), 2)
         self.assertEqual(loaded_rows[0]["sample_id"], "sample-1")
-        self.assertEqual(loaded_rows[0]["first_solution_move"], rows[0]["first_solution_move"])
+        self.assertEqual(
+            loaded_rows[0]["first_solution_move"], rows[0]["first_solution_move"]
+        )
 
     def test_model_forward_shape(self):
         model = SupervisedPolicyNet()
@@ -162,7 +162,10 @@ class SupervisedPolicyTests(unittest.TestCase):
         self.assertEqual(tuple(outputs.shape), (4, 12))
 
     def test_training_loop_runs_one_tiny_epoch(self):
-        rows = [generate_training_example(f"sample-{index}", 1).to_row() for index in range(6)]
+        rows = [
+            generate_training_example(f"sample-{index}", 1).to_row()
+            for index in range(6)
+        ]
         dataset = CubePolicyDataset(rows)
         train_dataset, validation_dataset = split_dataset(dataset, seed=1)
         model = SupervisedPolicyNet(hidden_size=32)

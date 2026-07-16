@@ -5,16 +5,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
 
 from agents.ppo_agent import write_history_csv  # noqa: E402
 
@@ -79,7 +74,7 @@ def _verify_history_csv(
     if len(history) != len(rows):
         raise ValueError(f"{history_path}: CSV row count does not match history")
 
-    for index, (source, output) in enumerate(zip(history, rows)):
+    for index, (source, output) in enumerate(zip(history, rows, strict=True)):
         if "evaluation" not in source:
             if output.get("evaluation", "") != "":
                 raise ValueError(
