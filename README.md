@@ -1,115 +1,202 @@
-# Project Title
+# Rubik's Cube Reinforcement Learning
 
-Briefly describe the purpose of this project.
+This project trains and evaluates agents that solve scrambled 3×3 Rubik's Cube
+states. It provides a custom PyTorch PPO trainer, a parallel Stable-Baselines3
+PPO trainer, optional supervised actor warm starts, curriculum learning,
+baseline solvers, and a local Streamlit showcase.
 
-## Project Structure
+The project is a research system rather than a complete general-purpose cube
+solver. Current experiments learn useful policies through scramble depth 7, but
+the deepest curriculum level is not yet mastered reliably.
+
+## What the project provides
+
+- Correct cube state, move, and notation primitives.
+- Generated labeled states stored as CSV or Parquet by scramble depth.
+- A Gymnasium environment for dataset-driven training.
+- Random, inverse-scramble, and breadth-first-search baselines.
+- Custom PyTorch PPO and Stable-Baselines3 PPO training workflows.
+- Supervised policy training and an SB3 actor warm-start workflow.
+- Curriculum gates, mixed-depth sampling, checkpoint selection, and detailed
+  behavior metrics.
+- A Streamlit interface for animated solve attempts and local benchmarks.
+
+## Architecture
 
 ```text
-config/                  Configuration files
-data/
-  raw/                   Original source data
-  external/              Third-party reference data
-  processed/             Cleaned or transformed data
-models/
-  saved_models/          Trained model files
-  artifacts/             Model metadata, encoders, and related outputs
-  logs/                  Training and evaluation logs
-notebooks/               Exploratory notebooks
-reports/
-  figures/               Generated charts and visual outputs
-skills/                  Project-specific reusable instructions
-src/
-  data/                  Data loading and preparation code
-  features/              Feature engineering code
-  models/                Training and inference code
-  utils/                 Shared utilities
-  visualization/         Plotting and reporting code
-tests/                   Automated tests
+streamlit_app.py and scripts/       User-facing commands
+              │
+              ▼
+src/showcase and src/agents/        Solving, training, evaluation, checkpoints
+              │
+              ├──────────────► src/curriculum/  Depth sampling and progression
+              │
+              ▼
+src/cube/gym_environment.py         Gymnasium dataset adapter
+src/cube/environment.py             Lightweight baseline/search adapter
+              │
+              ▼
+src/cube/episode.py                 Shared transition and reward rules
+src/cube/state.py, moves.py,        Framework-independent cube domain
+notation.py, encoding.py
 ```
 
-## Setup
+The important directories are:
+
+```text
+config/          Versioned curriculum definitions
+data/            Local generated datasets; large contents are gitignored
+models/          Local checkpoints and metrics; artifacts are gitignored
+notebooks/       Exploratory analysis
+reports/         Experiment reports and limitations
+scripts/         Thin command-line entry points
+src/agents/      Agents, trainers, metrics, and artifact persistence
+src/cube/        Cube domain, observation encoding, and environment adapters
+src/curriculum/  Curriculum configuration and state sampling
+src/data/        Training-data generation
+src/models/      Standalone supervised policy workflow
+src/showcase/    Checkpoint inference, solve service, and visualization
+tests/           Automated unit and integration tests
+```
+
+## Installation
+
+Python 3.11 or 3.12 is recommended; Python 3.14 is also supported.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -e ".[dev,notebooks]"
 ```
 
-## Workflow
+`pyproject.toml` defines supported dependency ranges. To reproduce the known-good
+local environment as closely as possible, also apply the constraints file:
 
-1. Place original inputs in `data/raw`.
-2. Keep reusable code in `src`.
-3. Store generated datasets in `data/processed`.
-4. Save trained models and related outputs under `models`.
-5. Put generated charts and report assets in `reports/figures`.
+```powershell
+python -m pip install -e ".[dev,notebooks]" -c constraints.txt
+```
 
-## Streamlit model showcase
+Editable installation makes `cube`, `agents`, `curriculum`, and the other
+packages importable without modifying `sys.path`.
 
-The local showcase generates seeded scramble sequences with lengths 1–10,
-animates PPO solve attempts, and runs per-length benchmarks without loading the
-large processed training datasets.
+## Quality checks
+
+Run the same checks used by continuous integration:
+
+```powershell
+ruff check .
+ruff format --check .
+mypy
+python -m pytest --cov --cov-report=term-missing
+```
+
+For a faster local regression run:
+
+```powershell
+python -m pytest -q
+```
+
+## Data workflow
+
+Generate labeled training states:
+
+```powershell
+rubix-generate-data --help
+```
+
+Or run the module directly:
+
+```powershell
+python -m scripts.generate_training_data --help
+```
+
+Generated files belong under `data/processed/training`. The PPO workflows use
+the Parquet depth shards under `data/processed/training/parquet` by default.
+Large data files are intentionally not committed.
+
+## Training
+
+Train the custom PPO implementation:
+
+```powershell
+rubix-train-ppo --help
+```
+
+Train the Stable-Baselines3 implementation:
+
+```powershell
+rubix-train-sb3 --help
+```
+
+Train a standalone supervised policy:
+
+```powershell
+rubix-train-supervised --help
+```
+
+An SB3 run can initialize its actor from supervised first-solution labels. For
+example, the depth-1–7 frontier workflow is configured through
+`scripts/train_sb3_ppo_agent.py`; use `--help` to see the current options.
+Scratch initialization remains the default, and warm start cannot be combined
+with checkpoint resume.
+
+See [reports/sb3_parallel_trainer.md](reports/sb3_parallel_trainer.md) for
+checkpoint semantics, controlled comparisons, and trainer differences.
+
+## Evaluation
+
+Evaluate a PPO checkpoint or the baseline agents with:
+
+```powershell
+rubix-evaluate-ppo --help
+rubix-evaluate-baselines --help
+```
+
+Metrics include solve and timeout rates, solution length, extra moves, inverse
+move behavior, and action distributions. Curriculum checkpoint selection favors
+the deepest reached level before comparing solve and timeout rates.
+
+## Streamlit showcase
 
 ```powershell
 python -m streamlit run streamlit_app.py
 ```
 
-The app discovers trusted local custom-PPO `.pt` and Stable-Baselines3 `.zip`
-checkpoints under `models/artifacts`.
-Artifacts remain gitignored and must exist on the machine running the app.
-Checkpoint curriculum metadata is displayed in the sidebar; scramble lengths
-beyond the checkpoint's evaluated depths are marked as experimental.
+The app discovers trusted local custom-PPO `.pt` and SB3 `.zip` checkpoints
+under `models/artifacts`. It supports seeded scrambles, greedy solving,
+reproducible stochastic retries, animation, per-depth benchmarks, and CSV
+exports. Checkpoints and generated run history are not uploaded anywhere.
 
-The app reports **scramble length**, not guaranteed optimal distance. A generated
-sequence can occasionally produce a state whose shortest solution is shorter
-than the sequence itself.
+## Artifact layout
 
-The solve demo:
+Runs use trainer-specific, versioned directories:
 
-- supports exact, uniform-range, and curriculum-weighted sampling;
-- runs a greedy attempt first and reproducible stochastic retries afterward;
-- enforces move, attempt, and cooperative wall-clock limits;
-- separates model inference and solver runtime from animation time; and
-- keeps downloadable run history only in the current Streamlit session.
-
-The benchmark compares greedy and retry-assisted PPO solve rates with the known
-inverse-scramble oracle. Its summary and detailed results can be downloaded as
-CSV files.
-
-Use `python -m streamlit` rather than the global `streamlit` command so the app
-runs with the same Python interpreter where the project dependencies, including
-PyTorch, were installed.
-
-## PPO trainers
-
-The original custom PyTorch trainer remains available:
-
-```powershell
-python scripts/train_ppo_agent.py
+```text
+models/artifacts/
+  ppo/<experiment>/v001/
+  sb3_ppo/<experiment>/v001/
+  supervised/
 ```
 
-Stable-Baselines3 is available as a parallel trainer with a separate artifact
-namespace:
+A run normally records its configuration, selected and final checkpoints,
+metrics, curriculum progress, and evaluation history. Warm-start runs also
+record split manifests, checkpoint hashes, and transition diagnostics. These
+large artifacts are gitignored and must be copied or regenerated separately.
 
-```powershell
-python scripts/train_sb3_ppo_agent.py
-```
+## Interpretation and limitations
 
-An optional supervised actor warm start can initialize SB3 from labeled
-first-solution moves without reducing the PPO timestep budget. For the initial
-depth-6 frontier experiment:
+- A reported depth is the generated **scramble length**, not necessarily the
+  optimal distance from the solved cube. Move cancellation can produce a state
+  with a shorter optimal solution.
+- Reaching a curriculum depth means the previous gate was passed. It does not
+  mean the newly reached depth is mastered.
+- A high solve rate can hide repeated-turn shortcuts or action collapse. Use
+  first-move and action-distribution diagnostics alongside solve rate.
+- Most historical experiments use a single seed. Trainer comparisons require
+  repeated, controlled multi-seed runs before making strong conclusions.
+- Local data and model artifacts are not stored in Git, so source checkout alone
+  does not reproduce historical experiments.
 
-```powershell
-python scripts/train_sb3_ppo_agent.py `
-  --curriculum-config config/curriculum_config_depth_1_10.yaml `
-  --supervised-warm-start `
-  --pretrain-depth-mode frontier `
-  --pretrain-max-depth 6
-```
-
-Scratch initialization remains the default. Warm start and `--resume-from`
-are intentionally mutually exclusive.
-
-See [reports/sb3_parallel_trainer.md](reports/sb3_parallel_trainer.md) for
-checkpoint semantics, resume instructions, controlled-comparison commands, and
-the differences that prevent bit-for-bit equivalence between trainers.
+More detail is available in [reports/ppo_limitations.md](reports/ppo_limitations.md)
+and [reports/ppo_curriculum_experiment_tracker.md](reports/ppo_curriculum_experiment_tracker.md).
