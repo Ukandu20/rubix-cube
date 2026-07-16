@@ -1,15 +1,1 @@
-numpy
-pandas
-pyarrow
-gymnasium
-matplotlib
-seaborn
-scikit-learn
-jupyter
-ipykernel
-python-dotenv
-requests
-pyyaml
-torch
-stable-baselines3==2.9.0
-streamlit
+-e .

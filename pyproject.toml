@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rubix-cube-rl"
+version = "0.1.0"
+description = "Rubik's Cube reinforcement-learning research and model showcase"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+authors = [{ name = "Rubix Cube contributors" }]
+dependencies = [
+  "gymnasium>=1.2,<2",
+  "matplotlib>=3.8,<4",
+  "numpy>=2.0,<3",
+  "pandas>=2.2,<4",
+  "pyarrow>=18,<25",
+  "python-dotenv>=1.0,<2",
+  "pyyaml>=6.0,<7",
+  "requests>=2.31,<3",
+  "scikit-learn>=1.5,<2",
+  "seaborn>=0.13,<1",
+  "stable-baselines3==2.9.0",
+  "streamlit>=1.40,<2",
+  "torch>=2.5,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.15,<2",
+  "pandas-stubs>=2.2,<3",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.11,<1",
+  "types-PyYAML>=6.0,<7",
+  "types-requests>=2.31,<3",
+]
+notebooks = [
+  "ipykernel>=6.29,<8",
+  "jupyter>=1.1,<2",
+]
+
+[project.scripts]
+rubix-generate-data = "scripts.generate_training_data:main"
+rubix-train-ppo = "scripts.train_ppo_agent:main"
+rubix-train-sb3 = "scripts.train_sb3_ppo_agent:main"
+rubix-train-supervised = "scripts.train_supervised_policy:main"
+rubix-evaluate-ppo = "scripts.evaluate_ppo_agent:main"
+rubix-evaluate-baselines = "scripts.evaluate_baselines:main"
+
+[tool.setuptools]
+package-dir = { "" = "src", "scripts" = "scripts" }
+packages = ["agents", "cube", "curriculum", "data", "models", "showcase", "scripts"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 70
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+extend-exclude = ["notebooks", "models", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B011", "E402", "SIM117"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/cube", "src/curriculum"]
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+ignore_missing_imports = true
