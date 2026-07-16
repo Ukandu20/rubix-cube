@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import random
-from typing import Optional
 
 from cube.environment import ACTION_SIZE, CubeEnvironment
 
@@ -11,7 +10,7 @@ from cube.environment import ACTION_SIZE, CubeEnvironment
 class RandomAgent:
     """Agent that chooses a legal action uniformly at random."""
 
-    def __init__(self, rng: Optional[random.Random] = None) -> None:
+    def __init__(self, rng: random.Random | None = None) -> None:
         self.rng = rng if rng is not None else random.Random()
 
     def act(self, env: CubeEnvironment) -> int:

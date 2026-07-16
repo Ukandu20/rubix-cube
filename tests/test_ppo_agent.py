@@ -1,4 +1,3 @@
-import sys
 import tempfile
 import unittest
 from collections import deque
@@ -9,18 +8,17 @@ import numpy as np
 import pandas as pd
 import torch
 
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 from agents.behavior_logging import BehaviorLogConfig, BehaviorLogger
 from agents.ppo_agent import (  # noqa: E402
-    ActorCriticNet,
     EXHAUSTIVE_EVAL_STATE_THRESHOLD,
-    NetworkConfig,
     OBSERVATION_SIZE,
     ONE_HOT_OBSERVATION_SIZE,
+    ActorCriticNet,
+    NetworkConfig,
     PPOConfig,
     RolloutBuffer,
+    _episode_window_metrics,
+    _evaluation_selection_mode,
     evaluate_ppo_model,
     evaluate_random_baseline,
     load_checkpoint,
@@ -30,8 +28,6 @@ from agents.ppo_agent import (  # noqa: E402
     preprocess_observations,
     save_checkpoint,
     select_action,
-    _evaluation_selection_mode,
-    _episode_window_metrics,
 )
 from cube.gym_environment import SOLVED_STATE_STRING, decode_state, encode_state
 from cube.moves import apply_move
@@ -112,7 +108,9 @@ class PPOAgentTests(unittest.TestCase):
         model = ActorCriticNet(NetworkConfig(hidden_layers=(16,)))
         observations = torch.zeros((4, ONE_HOT_OBSERVATION_SIZE))
         actor_parameter_ids = {id(parameter) for parameter in model.actor_parameters()}
-        critic_parameter_ids = {id(parameter) for parameter in model.critic_parameters()}
+        critic_parameter_ids = {
+            id(parameter) for parameter in model.critic_parameters()
+        }
 
         self.assertTrue(actor_parameter_ids)
         self.assertTrue(critic_parameter_ids)
@@ -242,20 +240,20 @@ class PPOAgentTests(unittest.TestCase):
 
         changed = any(
             not torch.allclose(previous, current)
-            for previous, current in zip(before, model.parameters())
+            for previous, current in zip(before, model.parameters(), strict=True)
         )
         self.assertTrue(changed)
         self.assertIn("policy_loss", metrics)
         self.assertIn("explained_variance", metrics)
         self.assertEqual(clip_grad_norm.call_count, 8)
         actor_parameter_ids = {id(parameter) for parameter in model.actor_parameters()}
-        critic_parameter_ids = {id(parameter) for parameter in model.critic_parameters()}
+        critic_parameter_ids = {
+            id(parameter) for parameter in model.critic_parameters()
+        }
         for call_index, call in enumerate(clip_grad_norm.call_args_list):
             clipped_parameter_ids = {id(parameter) for parameter in call.args[0]}
             expected_ids = (
-                actor_parameter_ids
-                if call_index % 2 == 0
-                else critic_parameter_ids
+                actor_parameter_ids if call_index % 2 == 0 else critic_parameter_ids
             )
             self.assertEqual(clipped_parameter_ids, expected_ids)
 
@@ -469,7 +467,9 @@ class PPOAgentTests(unittest.TestCase):
             )
             logger.flush()
 
-            episode_path = logs_root / "ppo_test" / "run_001" / "depth_1" / "episodes.parquet"
+            episode_path = (
+                logs_root / "ppo_test" / "run_001" / "depth_1" / "episodes.parquet"
+            )
             step_path = logs_root / "ppo_test" / "run_001" / "depth_1" / "steps.parquet"
             episodes = pd.read_parquet(episode_path)
             steps = pd.read_parquet(step_path)
@@ -542,7 +542,9 @@ class PPOAgentTests(unittest.TestCase):
         self.assertEqual(loaded_model.config.input_dim, ONE_HOT_OBSERVATION_SIZE)
         self.assertEqual(loaded_model.config.observation_encoding, "one_hot")
         self.assertEqual(checkpoint["checkpoint_version"], 2)
-        self.assertEqual(checkpoint["network_config"]["observation_encoding"], "one_hot")
+        self.assertEqual(
+            checkpoint["network_config"]["observation_encoding"], "one_hot"
+        )
 
     def test_old_normalized_checkpoint_without_encoding_loads(self):
         model = ActorCriticNet(
@@ -633,9 +635,7 @@ def _legacy_shared_state_dict(
             else:
                 legacy[f"shared.{suffix}"] = value
         elif key.startswith(f"critic.{output_layer_index}."):
-            parameter_name = key.removeprefix(
-                f"critic.{output_layer_index}."
-            )
+            parameter_name = key.removeprefix(f"critic.{output_layer_index}.")
             legacy[f"critic.{parameter_name}"] = value
     return legacy
 

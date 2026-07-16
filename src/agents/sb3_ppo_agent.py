@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Mapping
+from typing import Any
 
 import gymnasium as gym
 import numpy as np
 
 from agents.behavior_logging import utc_timestamp
 from agents.ppo_agent import (
+    COLOR_COUNT,
     DEFAULT_EVAL_EPISODES,
     DEFAULT_EVAL_FREQUENCY,
     DEFAULT_TOTAL_TIMESTEPS,
-    COLOR_COUNT,
     OBSERVATION_SIZE,
     ONE_HOT_OBSERVATION_SIZE,
     evaluate_ppo_model,
@@ -24,15 +25,14 @@ from agents.ppo_agent import (
     make_training_env,
     state_files_for_depths,
 )
-from cube.gym_environment import DEFAULT_MAX_EPISODE_STEPS, DEFAULT_TRAINING_DATA_DIR
-from curriculum.manager import CurriculumConfig, CurriculumManager
 from agents.sb3_supervised_warm_start import (
     SupervisedWarmStartConfig,
     reset_ppo_optimizer,
     run_supervised_warm_start,
     transition_snapshot,
 )
-
+from cube.gym_environment import DEFAULT_TRAINING_DATA_DIR
+from curriculum.manager import CurriculumConfig, CurriculumManager
 
 DEFAULT_SB3_OUTPUT_DIR = Path("models/artifacts/sb3_ppo")
 
@@ -278,24 +278,32 @@ def build_curriculum_callback(
                 **self.initialization_metadata,
             }
             previous = self.best_by_depth.get(depth)
-            if previous is None or (solve_rate, -timeout_rate) > (previous[0], -previous[1]):
+            if previous is None or (solve_rate, -timeout_rate) > (
+                previous[0],
+                -previous[1],
+            ):
                 self.best_by_depth[depth] = (solve_rate, timeout_rate)
                 _save_sb3_checkpoint(
-                    self.model, output_dir / f"best_model_depth_{depth}.zip",
+                    self.model,
+                    output_dir / f"best_model_depth_{depth}.zip",
                     metadata={**metadata, "selection": "best_at_curriculum_depth"},
                 )
             if (depth, solve_rate, -timeout_rate) > (
-                self.best_depth, self.best_solve_rate, -self.best_timeout_rate
+                self.best_depth,
+                self.best_solve_rate,
+                -self.best_timeout_rate,
             ):
                 self.best_depth, self.best_solve_rate = depth, solve_rate
                 self.best_timeout_rate = timeout_rate
                 _save_sb3_checkpoint(
-                    self.model, output_dir / "best_model.zip",
+                    self.model,
+                    output_dir / "best_model.zip",
                     metadata={**metadata, "selection": "curriculum_lexicographic"},
                 )
             if advanced:
                 _save_sb3_checkpoint(
-                    self.model, output_dir / "latest_passed_gate.zip",
+                    self.model,
+                    output_dir / "latest_passed_gate.zip",
                     metadata={
                         **metadata,
                         "selection": "latest_passed_curriculum_gate",
@@ -367,7 +375,9 @@ def train_sb3_ppo(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     manager = CurriculumManager(
-        state_files_for_depths(curriculum_config.min_depth, curriculum_config.max_depth, data_dir),
+        state_files_for_depths(
+            curriculum_config.min_depth, curriculum_config.max_depth, data_dir
+        ),
         curriculum_config,
         validate_dataset=validate_dataset,
         seed=seed,
@@ -379,8 +389,11 @@ def train_sb3_ppo(
     )
     factories = [
         make_sb3_env_factory(
-            curriculum_config=curriculum_config, data_dir=data_dir, seed=seed,
-            rank=rank, validate_dataset=validate_dataset,
+            curriculum_config=curriculum_config,
+            data_dir=data_dir,
+            seed=seed,
+            rank=rank,
+            validate_dataset=validate_dataset,
             state_data=(manager.depth_data if not subprocess else None),
         )
         for rank in range(n_envs)
@@ -388,12 +401,21 @@ def train_sb3_ppo(
     vec_env = (SubprocVecEnv if subprocess and n_envs > 1 else DummyVecEnv)(factories)
     if resume_from is None:
         model = PPO(
-            "MlpPolicy", vec_env, learning_rate=cfg.learning_rate, gamma=cfg.gamma,
-            gae_lambda=cfg.gae_lambda, clip_range=cfg.clip_range,
-            n_epochs=cfg.n_epochs, n_steps=cfg.n_steps, batch_size=cfg.batch_size,
-            ent_coef=cfg.ent_coef, vf_coef=cfg.vf_coef,
-            max_grad_norm=cfg.max_grad_norm, target_kl=cfg.target_kl,
-            seed=seed, device=device,
+            "MlpPolicy",
+            vec_env,
+            learning_rate=cfg.learning_rate,
+            gamma=cfg.gamma,
+            gae_lambda=cfg.gae_lambda,
+            clip_range=cfg.clip_range,
+            n_epochs=cfg.n_epochs,
+            n_steps=cfg.n_steps,
+            batch_size=cfg.batch_size,
+            ent_coef=cfg.ent_coef,
+            vf_coef=cfg.vf_coef,
+            max_grad_norm=cfg.max_grad_norm,
+            target_kl=cfg.target_kl,
+            seed=seed,
+            device=device,
             policy_kwargs={
                 "net_arch": {
                     "pi": list(cfg.hidden_layers),
@@ -422,17 +444,7 @@ def train_sb3_ppo(
             for depth, states in warm_result["test_states_by_depth"].items()
         }
         vec_env.env_method("exclude_states", held_out)
-        for depth, states in held_out.items():
-            if depth not in manager.depth_data:
-                continue
-            frame = manager.depth_data[depth]
-            retained = frame.loc[
-                ~frame["state_encoded"].astype(str).str.strip().isin(states)
-            ].reset_index(drop=True)
-            if retained.empty:
-                raise ValueError(f"excluding held-out states leaves depth {depth} empty")
-            manager.depth_data[depth] = retained
-            manager._next_state_index_by_depth[depth] = 0
+        manager.exclude_states(held_out)
         reset_ppo_optimizer(model)
         warm_context = {
             "diagnostic_examples": warm_result["diagnostic_examples"],
@@ -453,9 +465,13 @@ def train_sb3_ppo(
     initial_timesteps = int(model.num_timesteps)
     vec_env.env_method("set_curriculum_depth", manager.get_current_depth())
     callback = build_curriculum_callback(
-        manager=manager, output_dir=output_path, eval_frequency=eval_frequency,
-        eval_episodes=eval_episodes, data_dir=data_dir,
-        validate_dataset=validate_dataset, initial_timesteps=initial_timesteps,
+        manager=manager,
+        output_dir=output_path,
+        eval_frequency=eval_frequency,
+        eval_episodes=eval_episodes,
+        data_dir=data_dir,
+        validate_dataset=validate_dataset,
+        initial_timesteps=initial_timesteps,
         previous_evaluations=previous_evaluations,
         previous_selection=previous_selection,
         initialization_metadata=initialization_metadata,
@@ -477,33 +493,48 @@ def train_sb3_ppo(
     elapsed = perf_counter() - start
     final_depth = manager.get_current_depth()
     final_evaluation = evaluate_ppo_model(
-        SB3RawObservationPolicy(model), depths=(final_depth,),
+        SB3RawObservationPolicy(model),
+        depths=(final_depth,),
         episodes_per_depth=eval_episodes,
         max_episode_steps=curriculum_config.max_episode_steps(final_depth),
-        data_dir=data_dir, validate_dataset=validate_dataset,
+        data_dir=data_dir,
+        validate_dataset=validate_dataset,
         state_data=manager.depth_data,
     )
     metadata = {
-        "trainer": "stable_baselines3", "timesteps": model.num_timesteps,
-        "evaluation": final_evaluation, "curriculum": manager.progress(),
+        "trainer": "stable_baselines3",
+        "timesteps": model.num_timesteps,
+        "evaluation": final_evaluation,
+        "curriculum": manager.progress(),
         **initialization_metadata,
     }
     _save_sb3_checkpoint(model, output_path / "final_model.zip", metadata=metadata)
     random_baseline = evaluate_random_baseline(
         depths=range(curriculum_config.min_depth, curriculum_config.max_depth + 1),
-        episodes_per_depth=max(1, min(eval_episodes, 20)), data_dir=data_dir,
-        seed=seed, validate_dataset=validate_dataset,
+        episodes_per_depth=max(1, min(eval_episodes, 20)),
+        data_dir=data_dir,
+        seed=seed,
+        validate_dataset=validate_dataset,
         state_data=manager.depth_data,
     )
     run_config = {
-        "trainer": "stable_baselines3", "total_timesteps": total_timesteps,
-        "actual_timesteps": model.num_timesteps, "seed": seed, "device": device,
+        "trainer": "stable_baselines3",
+        "total_timesteps": total_timesteps,
+        "actual_timesteps": model.num_timesteps,
+        "seed": seed,
+        "device": device,
         "initial_timesteps": initial_timesteps,
         "resume_from": str(resume_from) if resume_from is not None else None,
-        "n_envs": n_envs, "subprocess": subprocess, "ppo": asdict(cfg),
+        "n_envs": n_envs,
+        "subprocess": subprocess,
+        "ppo": asdict(cfg),
         "curriculum": curriculum_config.to_dict(),
         **initialization_metadata,
-        "training_session": {"started_at": started_at, "completed_at": utc_timestamp(), "elapsed_seconds": elapsed},
+        "training_session": {
+            "started_at": started_at,
+            "completed_at": utc_timestamp(),
+            "elapsed_seconds": elapsed,
+        },
         **dict(output_metadata or {}),
     }
     metrics = {
@@ -535,9 +566,8 @@ def train_sb3_ppo(
     experiment_summary = {
         "trainer": "stable_baselines3",
         "ppo_timesteps": model.num_timesteps - initial_timesteps,
-        "total_runtime_seconds": elapsed + float(
-            initialization_metadata.get("supervised_runtime_seconds", 0.0)
-        ),
+        "total_runtime_seconds": elapsed
+        + float(initialization_metadata.get("supervised_runtime_seconds", 0.0)),
         **initialization_metadata,
         "final_evaluation": final_evaluation,
         "curriculum_progress": manager.progress(),
@@ -545,4 +575,9 @@ def train_sb3_ppo(
     _write_json(output_path / "config.json", run_config)
     _write_json(output_path / "metrics.json", metrics)
     _write_json(output_path / "experiment_summary.json", experiment_summary)
-    return {"model": model, "config": run_config, "metrics": metrics, "output_dir": output_path}
+    return {
+        "model": model,
+        "config": run_config,
+        "metrics": metrics,
+        "output_dir": output_path,
+    }

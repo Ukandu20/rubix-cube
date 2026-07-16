@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import csv
 import json
 import random
 from collections import deque
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping
+from dataclasses import asdict
 from pathlib import Path
-from statistics import mean, median
+from statistics import mean
 from time import perf_counter
-from typing import Any, Literal, Mapping, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -18,17 +18,42 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributions import Categorical
 
+from agents.artifact_io import write_history_csv
+from agents.artifact_io import write_json as _write_json
 from agents.behavior_logging import BehaviorLogger, utc_timestamp
+from agents.ppo_metrics import (
+    episode_window_metrics as _episode_window_metrics,
+)
+from agents.ppo_metrics import (
+    evaluation_metrics as _evaluation_metrics,
+)
+from agents.ppo_network import (
+    ACTION_SIZE,
+    COLOR_COUNT,
+    OBSERVATION_SIZE,
+    ONE_HOT_OBSERVATION_SIZE,
+)
+from agents.ppo_network import (
+    ActorCriticNet as ActorCriticNet,
+)
+from agents.ppo_network import (
+    NetworkConfig as NetworkConfig,
+)
+from agents.ppo_network import (
+    ObservationEncoding as ObservationEncoding,
+)
+from agents.ppo_network import (
+    PPOConfig as PPOConfig,
+)
+from cube.encoding import encode_state
 from cube.environment import ACTION_TO_MOVE
 from cube.gym_environment import (
     DEFAULT_EXHAUSTIVE_STATE_THRESHOLD,
     DEFAULT_MAX_EPISODE_STEPS,
     DEFAULT_TRAINING_DATA_DIR,
     RubixCubeSolveEnv,
-    encode_state,
 )
 from curriculum.manager import CurriculumConfig, CurriculumManager
-
 
 DEFAULT_OUTPUT_DIR = Path("models/artifacts/ppo")
 DEFAULT_TOTAL_TIMESTEPS = 500_000
@@ -36,95 +61,7 @@ DEFAULT_EVAL_FREQUENCY = 10_000
 DEFAULT_EVAL_EPISODES = 100
 EXHAUSTIVE_STATE_THRESHOLD = DEFAULT_EXHAUSTIVE_STATE_THRESHOLD
 EXHAUSTIVE_EVAL_STATE_THRESHOLD = EXHAUSTIVE_STATE_THRESHOLD
-OBSERVATION_SIZE = 54
-COLOR_COUNT = 6
-ONE_HOT_OBSERVATION_SIZE = OBSERVATION_SIZE * COLOR_COUNT
-ACTION_SIZE = 12
 CHECKPOINT_VERSION = 2
-ObservationEncoding = Literal["one_hot", "normalized"]
-
-
-@dataclass(frozen=True)
-class PPOConfig:
-    """Hyperparameters for the custom PPO trainer."""
-
-    learning_rate: float = 3e-4
-    gamma: float = 0.95
-    gae_lambda: float = 0.95
-    clip_range: float = 0.2
-    n_epochs: int = 10
-    n_steps: int = 2048
-    batch_size: int = 64
-    ent_coef: float = 0.01
-    vf_coef: float = 0.5
-    max_grad_norm: float = 0.5
-    target_kl: float | None = 0.03
-
-
-@dataclass(frozen=True)
-class NetworkConfig:
-    """Actor-critic MLP shape."""
-
-    input_dim: int = ONE_HOT_OBSERVATION_SIZE
-    hidden_layers: tuple[int, ...] = (256, 256)
-    actor_output_dim: int = ACTION_SIZE
-    critic_output_dim: int = 1
-    observation_encoding: ObservationEncoding = "one_hot"
-
-    def __post_init__(self) -> None:
-        if self.observation_encoding not in ("one_hot", "normalized"):
-            raise ValueError("observation_encoding must be 'one_hot' or 'normalized'")
-
-
-class ActorCriticNet(nn.Module):
-    """Independent actor and critic MLPs."""
-
-    def __init__(self, config: NetworkConfig | None = None) -> None:
-        super().__init__()
-        self.config = config or NetworkConfig()
-        self.actor = _build_mlp(
-            input_dim=self.config.input_dim,
-            hidden_layers=self.config.hidden_layers,
-            output_dim=self.config.actor_output_dim,
-        )
-        self.critic = _build_mlp(
-            input_dim=self.config.input_dim,
-            hidden_layers=self.config.hidden_layers,
-            output_dim=self.config.critic_output_dim,
-        )
-
-    def forward(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = self.actor(observations)
-        values = self.critic(observations).squeeze(-1)
-        return logits, values
-
-    def actor_parameters(self) -> tuple[nn.Parameter, ...]:
-        """Return actor parameters for branch-specific optimization controls."""
-
-        return tuple(self.actor.parameters())
-
-    def critic_parameters(self) -> tuple[nn.Parameter, ...]:
-        """Return critic parameters for branch-specific optimization controls."""
-
-        return tuple(self.critic.parameters())
-
-
-def _build_mlp(
-    *,
-    input_dim: int,
-    hidden_layers: tuple[int, ...],
-    output_dim: int,
-) -> nn.Sequential:
-    """Build one actor or critic MLP."""
-
-    layers: list[nn.Module] = []
-    previous_dim = input_dim
-    for hidden_dim in hidden_layers:
-        layers.append(nn.Linear(previous_dim, hidden_dim))
-        layers.append(nn.ReLU())
-        previous_dim = hidden_dim
-    layers.append(nn.Linear(previous_dim, output_dim))
-    return nn.Sequential(*layers)
 
 
 class RolloutBuffer:
@@ -255,7 +192,11 @@ def state_files_for_depths(
     for depth in range(min_depth, max_depth + 1):
         parquet_path = root / f"depth_{depth}.parquet"
         csv_path = root / f"depth_{depth}.csv"
-        state_files[depth] = csv_path if csv_path.exists() and not parquet_path.exists() else parquet_path
+        state_files[depth] = (
+            csv_path
+            if csv_path.exists() and not parquet_path.exists()
+            else parquet_path
+        )
     return state_files
 
 
@@ -454,7 +395,8 @@ def collect_rollout(
                     "reward": episode_reward,
                     "length": episode_length,
                     "solved": bool(next_info.get("is_solved", False)),
-                    "timeout": next_info.get("terminated_reason") == "max_steps_reached",
+                    "timeout": next_info.get("terminated_reason")
+                    == "max_steps_reached",
                     "inverse_moves": episode_inverse_moves,
                     "start_depth": next_info.get("start_depth"),
                 }
@@ -501,7 +443,9 @@ def ppo_update(
         observation_encoding=model.config.observation_encoding,
     )
     advantages = tensors["advantages"]
-    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+    advantages = (advantages - advantages.mean()) / (
+        advantages.std(unbiased=False) + 1e-8
+    )
     sample_count = len(buffer)
     batch_size = min(config.batch_size, sample_count)
     metrics: dict[str, list[float]] = {
@@ -535,7 +479,11 @@ def ppo_update(
             policy_loss = -torch.min(unclipped, clipped).mean()
             value_loss = (tensors["returns"][indices] - new_values).pow(2).mean()
             entropy_loss = entropy.mean()
-            loss = policy_loss + config.vf_coef * value_loss - config.ent_coef * entropy_loss
+            loss = (
+                policy_loss
+                + config.vf_coef * value_loss
+                - config.ent_coef * entropy_loss
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -552,9 +500,7 @@ def ppo_update(
             with torch.no_grad():
                 approx_kl = ((ratio - 1.0) - log_ratio).mean()
                 clip_fraction = (
-                    (torch.abs(ratio - 1.0) > config.clip_range)
-                    .float()
-                    .mean()
+                    (torch.abs(ratio - 1.0) > config.clip_range).float().mean()
                 )
 
             metrics["policy_loss"].append(float(policy_loss.item()))
@@ -564,9 +510,12 @@ def ppo_update(
             metrics["clip_fraction"].append(float(clip_fraction.item()))
             metrics["loss"].append(float(loss.item()))
 
-        if config.target_kl is not None and metrics["approx_kl"]:
-            if metrics["approx_kl"][-1] > 1.5 * config.target_kl:
-                break
+        if (
+            config.target_kl is not None
+            and metrics["approx_kl"]
+            and metrics["approx_kl"][-1] > 1.5 * config.target_kl
+        ):
+            break
 
     result = {key: mean(values) if values else 0.0 for key, values in metrics.items()}
     result["explained_variance"] = explained_variance(
@@ -607,7 +556,9 @@ def train_ppo(
     training_started_at = utc_timestamp()
     training_start_time = perf_counter()
     ppo_config = config or PPOConfig()
-    run_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    run_device = torch.device(
+        device or ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     set_random_seeds(seed)
 
     if curriculum_manager is None and curriculum_config is not None:
@@ -664,9 +615,7 @@ def train_ppo(
         seed=seed,
         validate_dataset=validate_dataset,
         state_data=(
-            curriculum_manager.depth_data
-            if curriculum_manager is not None
-            else None
+            curriculum_manager.depth_data if curriculum_manager is not None else None
         ),
     )
 
@@ -709,9 +658,7 @@ def train_ppo(
             evaluation_max_steps = max_episode_steps
             evaluated_curriculum_depth = None
             if curriculum_manager is not None and curriculum_config is not None:
-                evaluated_curriculum_depth = (
-                    curriculum_manager.get_current_depth()
-                )
+                evaluated_curriculum_depth = curriculum_manager.get_current_depth()
                 evaluation_depths = (evaluated_curriculum_depth,)
                 evaluation_max_steps = curriculum_config.max_episode_steps(
                     evaluated_curriculum_depth
@@ -742,9 +689,7 @@ def train_ppo(
                 and curriculum_config is not None
                 and evaluated_curriculum_depth is not None
             ):
-                depth_metrics = evaluation["by_depth"][
-                    str(evaluated_curriculum_depth)
-                ]
+                depth_metrics = evaluation["by_depth"][str(evaluated_curriculum_depth)]
                 threshold = curriculum_config.advancement_thresholds[
                     evaluated_curriculum_depth
                 ]
@@ -759,9 +704,7 @@ def train_ppo(
                     "metrics": depth_metrics,
                     "threshold": asdict(threshold),
                     "advanced_curriculum": advanced_curriculum,
-                    "next_curriculum_depth": (
-                        curriculum_manager.get_current_depth()
-                    ),
+                    "next_curriculum_depth": (curriculum_manager.get_current_depth()),
                 }
                 curriculum_evaluations.append(curriculum_evaluation)
                 row["curriculum_evaluation"] = curriculum_evaluation
@@ -779,9 +722,7 @@ def train_ppo(
                 "evaluation": evaluation,
             }
             if curriculum_manager is not None:
-                checkpoint_metadata["curriculum"] = (
-                    curriculum_manager.progress()
-                )
+                checkpoint_metadata["curriculum"] = curriculum_manager.progress()
 
             if evaluated_curriculum_depth is not None:
                 depth_best = best_by_depth.get(evaluated_curriculum_depth)
@@ -808,9 +749,7 @@ def train_ppo(
                         metadata={
                             **checkpoint_metadata,
                             "selection": "best_at_curriculum_depth",
-                            "evaluated_curriculum_depth": (
-                                evaluated_curriculum_depth
-                            ),
+                            "evaluated_curriculum_depth": (evaluated_curriculum_depth),
                         },
                     )
 
@@ -839,9 +778,7 @@ def train_ppo(
                         metadata={
                             **checkpoint_metadata,
                             "selection": "curriculum_lexicographic",
-                            "evaluated_curriculum_depth": (
-                                evaluated_curriculum_depth
-                            ),
+                            "evaluated_curriculum_depth": (evaluated_curriculum_depth),
                         },
                     )
 
@@ -890,9 +827,7 @@ def train_ppo(
         device=run_device,
         validate_dataset=validate_dataset,
         state_data=(
-            curriculum_manager.depth_data
-            if curriculum_manager is not None
-            else None
+            curriculum_manager.depth_data if curriculum_manager is not None else None
         ),
     )
     final_checkpoint_metadata = {
@@ -926,9 +861,7 @@ def train_ppo(
         "ppo": asdict(ppo_config),
         "network": _network_config_dict(network_config or NetworkConfig()),
         "curriculum": (
-            curriculum_config.to_dict()
-            if curriculum_config is not None
-            else None
+            curriculum_config.to_dict() if curriculum_config is not None else None
         ),
         "training_session": training_session,
     }
@@ -1142,9 +1075,7 @@ def _evaluate_policy(
             data_dir=data_dir,
             validate_dataset=validate_dataset,
             state_data=(
-                {int(depth): state_data[int(depth)]}
-                if state_data is not None
-                else None
+                {int(depth): state_data[int(depth)]} if state_data is not None else None
             ),
         )
         if seed is not None:
@@ -1162,9 +1093,7 @@ def _evaluate_policy(
         depth_rows: list[dict[str, Any]] = []
         for episode in range(evaluation_episodes):
             episode_seed = (
-                None
-                if seed is None
-                else seed + int(depth) * 10_000 + episode
+                None if seed is None else seed + int(depth) * 10_000 + episode
             )
             reset_options = (
                 {"state_index": episode}
@@ -1181,7 +1110,11 @@ def _evaluate_policy(
             final_info: dict[str, Any] = {}
             previous_action: int | None = None
             moves_taken: list[str] = []
-            episode_id = f"{behavior_logger.config.run_id}-depth{depth}-episode{episode}" if behavior_logger else ""
+            episode_id = (
+                f"{behavior_logger.config.run_id}-depth{depth}-episode{episode}"
+                if behavior_logger
+                else ""
+            )
             episode_started_at = utc_timestamp()
 
             while not done:
@@ -1192,7 +1125,9 @@ def _evaluate_policy(
                     policy_debug = _empty_policy_debug()
                 else:
                     action, policy_debug = _policy_decision(model, observation, device)
-                next_observation, reward, terminated, truncated, final_info = env.step(action)
+                next_observation, reward, terminated, truncated, final_info = env.step(
+                    action
+                )
                 done = bool(terminated or truncated)
                 episode_reward += float(reward)
                 inverse_moves += int(final_info.get("immediate_inverse_move", False))
@@ -1213,12 +1148,16 @@ def _evaluate_policy(
                             "end_state": encode_state(next_observation),
                             "reward": float(reward),
                             "total_reward_so_far": episode_reward,
-                            "moves_used_so_far": int(final_info.get("current_step", step_index + 1)),
+                            "moves_used_so_far": int(
+                                final_info.get("current_step", step_index + 1)
+                            ),
                             "previous_action": previous_action,
                             "immediate_inverse_move": bool(
                                 final_info.get("immediate_inverse_move", False)
                             ),
-                            "solved_after_move": bool(final_info.get("is_solved", False)),
+                            "solved_after_move": bool(
+                                final_info.get("is_solved", False)
+                            ),
                             "done": done,
                             "termination_reason": final_info.get(
                                 "terminated_reason",
@@ -1355,83 +1294,6 @@ def _empty_policy_debug() -> dict[str, None]:
     }
 
 
-def _evaluation_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    solved_rows = [row for row in rows if row["solved"]]
-    solution_lengths = [
-        int(row["solution_length"])
-        for row in solved_rows
-        if row["solution_length"] is not None
-    ]
-    extra_moves = [
-        int(row["extra_moves"])
-        for row in solved_rows
-        if row["extra_moves"] is not None
-    ]
-    total_steps = sum(int(row["steps"]) for row in rows)
-    action_counts = _action_counts(rows)
-    return {
-        "episodes": len(rows),
-        "solved_count": len(solved_rows),
-        "solve_rate": len(solved_rows) / len(rows) if rows else 0.0,
-        "average_reward": mean(row["reward"] for row in rows) if rows else 0.0,
-        "average_solution_length": mean(solution_lengths) if solution_lengths else None,
-        "median_solution_length": median(solution_lengths) if solution_lengths else None,
-        "timeout_rate": (
-            sum(int(row["timeout"]) for row in rows) / len(rows) if rows else 0.0
-        ),
-        "inverse_move_rate": (
-            sum(int(row["inverse_moves"]) for row in rows) / total_steps
-            if total_steps
-            else 0.0
-        ),
-        "average_extra_moves": mean(extra_moves) if extra_moves else None,
-        "action_counts": action_counts,
-        "action_distribution": _action_distribution(action_counts),
-    }
-
-
-def _action_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
-    counts = {ACTION_TO_MOVE[action_id]: 0 for action_id in sorted(ACTION_TO_MOVE)}
-    for row in rows:
-        for move in row.get("moves_taken", []):
-            if move in counts:
-                counts[move] += 1
-    return counts
-
-
-def _action_distribution(action_counts: Mapping[str, int]) -> dict[str, float]:
-    total = sum(int(count) for count in action_counts.values())
-    if total == 0:
-        return {move: 0.0 for move in action_counts}
-    return {
-        move: int(count) / total
-        for move, count in action_counts.items()
-    }
-
-
-def _episode_window_metrics(episodes: deque[dict[str, Any]]) -> dict[str, float]:
-    if not episodes:
-        return {
-            "mean_episode_reward": 0.0,
-            "mean_episode_length": 0.0,
-            "train_solve_rate": 0.0,
-            "timeout_rate": 0.0,
-            "inverse_move_rate": 0.0,
-        }
-    total_steps = sum(int(row["length"]) for row in episodes)
-    return {
-        "mean_episode_reward": mean(float(row["reward"]) for row in episodes),
-        "mean_episode_length": mean(int(row["length"]) for row in episodes),
-        "train_solve_rate": mean(float(row["solved"]) for row in episodes),
-        "timeout_rate": mean(float(row["timeout"]) for row in episodes),
-        "inverse_move_rate": (
-            sum(int(row["inverse_moves"]) for row in episodes) / total_steps
-            if total_steps
-            else 0.0
-        ),
-    }
-
-
 def _network_config_dict(config: NetworkConfig) -> dict[str, Any]:
     payload = asdict(config)
     payload["hidden_layers"] = list(config.hidden_layers)
@@ -1443,7 +1305,9 @@ def _network_config_from_dict(payload: Mapping[str, Any]) -> NetworkConfig:
     if "observation_encoding" in payload:
         observation_encoding = payload["observation_encoding"]
     else:
-        observation_encoding = "normalized" if input_dim == OBSERVATION_SIZE else "one_hot"
+        observation_encoding = (
+            "normalized" if input_dim == OBSERVATION_SIZE else "one_hot"
+        )
 
     return NetworkConfig(
         input_dim=input_dim,
@@ -1452,58 +1316,3 @@ def _network_config_from_dict(payload: Mapping[str, Any]) -> NetworkConfig:
         critic_output_dim=int(payload.get("critic_output_dim", 1)),
         observation_encoding=observation_encoding,
     )
-
-
-def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-
-
-def write_history_csv(
-    path: Path | str,
-    history: list[Mapping[str, Any]],
-) -> None:
-    """Write PPO update history as CSV, encoding nested values as JSON."""
-
-    rows = list(history)
-    for index, row in enumerate(rows):
-        if not isinstance(row, Mapping):
-            raise TypeError(f"history row {index} must be a mapping")
-
-    fieldnames: list[str] = []
-    seen_fields: set[str] = set()
-    for row in rows:
-        for fieldname in row:
-            if not isinstance(fieldname, str):
-                raise TypeError("history field names must be strings")
-            if fieldname not in seen_fields:
-                seen_fields.add(fieldname)
-                fieldnames.append(fieldname)
-
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.tmp")
-
-    try:
-        with temporary.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            if fieldnames:
-                writer.writeheader()
-                for row in rows:
-                    writer.writerow(
-                        {
-                            key: _history_csv_value(row.get(key))
-                            for key in fieldnames
-                        }
-                    )
-        temporary.replace(destination)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
-def _history_csv_value(value: Any) -> Any:
-    if isinstance(value, (Mapping, list, tuple)):
-        return json.dumps(value, separators=(",", ":"), sort_keys=True)
-    return value

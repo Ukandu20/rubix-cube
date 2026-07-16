@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import csv
 import random
+from collections.abc import Iterable
 from pathlib import Path
 from time import perf_counter
-from typing import Iterable, Optional
 
 from agents.bfs_agent import BFSAgent
 from agents.inverse_scramble_agent import InverseScrambleAgent
 from agents.random_agent import RandomAgent
 from cube.environment import CubeEnvironment
 from cube.moves import apply_move
-
 
 DEFAULT_DEPTHS = range(1, 6)
 DEFAULT_CSV_PATH = Path("reports/baselines.csv")
@@ -22,7 +21,7 @@ DEFAULT_CSV_PATH = Path("reports/baselines.csv")
 def evaluate_random_agent(
     depths: Iterable[int] = DEFAULT_DEPTHS,
     episodes_per_depth: int = 100,
-    rng: Optional[random.Random] = None,
+    rng: random.Random | None = None,
 ) -> list[dict]:
     """Evaluate random actions using each environment episode limit."""
 
@@ -64,7 +63,7 @@ def evaluate_random_agent(
 def evaluate_inverse_scramble_agent(
     depths: Iterable[int] = DEFAULT_DEPTHS,
     episodes_per_depth: int = 10,
-    rng: Optional[random.Random] = None,
+    rng: random.Random | None = None,
 ) -> list[dict]:
     """Evaluate the inverse-scramble debugging baseline."""
 
@@ -107,7 +106,7 @@ def evaluate_bfs_agent(
     depths: Iterable[int] = DEFAULT_DEPTHS,
     episodes_per_depth: int = 1,
     max_depth: int = 7,
-    rng: Optional[random.Random] = None,
+    rng: random.Random | None = None,
 ) -> list[dict]:
     """Evaluate shallow BFS and include search-cost metrics."""
 
@@ -156,9 +155,7 @@ def evaluate_bfs_agent(
     return results
 
 
-def write_results_csv(
-    results: list[dict], path: Path | str = DEFAULT_CSV_PATH
-) -> Path:
+def write_results_csv(results: list[dict], path: Path | str = DEFAULT_CSV_PATH) -> Path:
     """Write evaluation dictionaries to CSV and return the output path."""
 
     output_path = Path(path)
@@ -187,11 +184,7 @@ def print_results_table(results: list[dict]) -> None:
     print(" | ".join(columns))
     print(" | ".join("-" * len(column) for column in columns))
     for row in results:
-        print(
-            " | ".join(
-                _format_value(row.get(column, "")) for column in columns
-            )
-        )
+        print(" | ".join(_format_value(row.get(column, "")) for column in columns))
 
 
 def _base_metrics(

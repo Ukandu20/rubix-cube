@@ -1,4 +1,3 @@
-import sys
 import json
 import tempfile
 import unittest
@@ -8,13 +7,11 @@ from unittest.mock import Mock, patch
 import gymnasium as gym
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 from agents.sb3_ppo_agent import (
     OneHotObservation,
     SB3RawObservationPolicy,
-    build_curriculum_callback,
     _restore_curriculum_progress,
+    build_curriculum_callback,
 )
 from cube.gym_environment import SOLVED_STATE_STRING, decode_state
 from curriculum.manager import AdvancementThreshold
@@ -115,9 +112,7 @@ class SB3PPOAgentTests(unittest.TestCase):
             "events": [],
         }
         manager.config.max_episode_steps.return_value = 3
-        manager.config.advancement_thresholds = {
-            1: AdvancementThreshold(0.9, 2, 0.1)
-        }
+        manager.config.advancement_thresholds = {1: AdvancementThreshold(0.9, 2, 0.1)}
         with tempfile.TemporaryDirectory() as directory:
             callback = build_curriculum_callback(
                 manager=manager,
@@ -134,9 +129,7 @@ class SB3PPOAgentTests(unittest.TestCase):
 
             self.assertTrue(callback._on_step())
 
-            training_env.env_method.assert_called_once_with(
-                "set_curriculum_depth", 2
-            )
+            training_env.env_method.assert_called_once_with("set_curriculum_depth", 2)
             self.assertEqual(callback.evaluations[0]["curriculum_depth"], 1)
             self.assertTrue(callback.evaluations[0]["advanced_curriculum"])
             self.assertEqual(save_checkpoint.call_count, 3)

@@ -5,14 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import platform
 import random
 from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import median
 from time import perf_counter
-from typing import Any, Iterable, Literal, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -20,115 +20,33 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from cube.environment import ACTION_TO_MOVE, MOVE_TO_ACTION
-from cube.gym_environment import COLOR_TO_INT, INVERSE_ACTION, validate_encoded_state
+from agents.warm_start_checkpoints import (
+    ACTION_COUNT,
+    ACTION_ORDER,
+)
+from agents.warm_start_checkpoints import (
+    checkpoint_payload as _checkpoint_payload,
+)
+from agents.warm_start_checkpoints import (
+    load_supervised_warm_start_checkpoint as load_supervised_warm_start_checkpoint,
+)
+from agents.warm_start_checkpoints import (
+    reset_ppo_optimizer as reset_ppo_optimizer,
+)
+from agents.warm_start_config import (
+    DepthSampling as DepthSampling,
+)
+from agents.warm_start_config import (
+    SupervisedWarmStartConfig as SupervisedWarmStartConfig,
+)
+from cube.encoding import COLOR_TO_INT, validate_encoded_state
+from cube.environment import MOVE_TO_ACTION
+from cube.gym_environment import INVERSE_ACTION
 from cube.moves import apply_move
 from cube.state import CubeState
 from curriculum.manager import CurriculumConfig
 
-
-OBSERVATION_ENCODING = "one_hot"
-OBSERVATION_SHAPE = (54 * 6,)
-ACTION_ORDER = tuple(ACTION_TO_MOVE[index] for index in sorted(ACTION_TO_MOVE))
-ACTION_COUNT = len(ACTION_ORDER)
-STATE_ENCODER_VERSION = "sb3_cube_one_hot_v1"
-MODEL_ARCHITECTURE_VERSION = "sb3_mlp_actor_critic_v1"
 SPLIT_MANIFEST_NAME = "supervised_split_manifest.json"
-DepthMode = Literal["mastered", "frontier", "full-curriculum", "custom"]
-DepthSampling = Literal["balanced", "natural", "frontier-weighted"]
-
-
-@dataclass(frozen=True)
-class SupervisedWarmStartConfig:
-    """Validated settings for the optional actor warm start."""
-
-    depth_mode: DepthMode = "frontier"
-    min_depth: int | None = None
-    max_depth: int | None = None
-    epochs: int = 10
-    batch_size: int = 256
-    learning_rate: float = 1e-3
-    sample_per_depth: int = 100_000
-    validation_fraction: float = 0.10
-    test_fraction: float = 0.10
-    depth_sampling: DepthSampling = "balanced"
-    label_smoothing: float = 0.01
-    early_stopping_patience: int = 2
-    gradient_clip_norm: float = 1.0
-    update_shared_encoder: bool = False
-    rollout_sample_per_depth: int = 1_000
-
-    def __post_init__(self) -> None:
-        if self.depth_mode not in (
-            "mastered", "frontier", "full-curriculum", "custom"
-        ):
-            raise ValueError("unsupported supervised depth mode")
-        if self.depth_sampling not in (
-            "balanced", "natural", "frontier-weighted"
-        ):
-            raise ValueError("unsupported supervised depth sampling strategy")
-        if self.depth_mode in ("mastered", "frontier") and self.max_depth is None:
-            raise ValueError(
-                f"pretrain_max_depth is required for {self.depth_mode!r} mode"
-            )
-        if self.depth_mode == "custom" and (
-            self.min_depth is None or self.max_depth is None
-        ):
-            raise ValueError("custom mode requires pretrain_min_depth and pretrain_max_depth")
-        if self.min_depth is not None and self.min_depth <= 0:
-            raise ValueError("pretrain_min_depth must be positive")
-        if self.max_depth is not None and self.max_depth <= 0:
-            raise ValueError("pretrain_max_depth must be positive")
-        if (
-            self.min_depth is not None
-            and self.max_depth is not None
-            and self.min_depth > self.max_depth
-        ):
-            raise ValueError("pretrain_min_depth cannot exceed pretrain_max_depth")
-        if min(
-            self.epochs,
-            self.batch_size,
-            self.sample_per_depth,
-            self.early_stopping_patience,
-            self.rollout_sample_per_depth,
-        ) <= 0:
-            raise ValueError("supervised count and patience settings must be positive")
-        if self.learning_rate <= 0.0 or self.gradient_clip_norm <= 0.0:
-            raise ValueError("supervised learning rate and clip norm must be positive")
-        if not 0.0 <= self.label_smoothing < 1.0:
-            raise ValueError("pretrain_label_smoothing must be in [0, 1)")
-        if not 0.0 < self.validation_fraction < 1.0:
-            raise ValueError("pretrain_validation_fraction must be in (0, 1)")
-        if not 0.0 < self.test_fraction < 1.0:
-            raise ValueError("pretrain_test_fraction must be in (0, 1)")
-        if self.validation_fraction + self.test_fraction >= 1.0:
-            raise ValueError("validation and test fractions must sum to less than 1")
-        if self.update_shared_encoder:
-            raise ValueError(
-                "the current SB3 policy has no trainable shared encoder; "
-                "pretrain_update_shared_encoder is unsupported"
-            )
-
-    def selected_depths(self, curriculum: CurriculumConfig) -> tuple[int, ...]:
-        """Resolve the exact supervised depths for one curriculum."""
-
-        minimum = self.min_depth or curriculum.min_depth
-        if self.depth_mode == "full-curriculum":
-            minimum, maximum = curriculum.min_depth, curriculum.max_depth
-        elif self.depth_mode == "mastered":
-            maximum = int(self.max_depth) - 1
-        else:
-            maximum = int(self.max_depth)
-        if minimum < curriculum.min_depth or maximum > curriculum.max_depth:
-            raise ValueError("supervised depth range is outside the curriculum")
-        if maximum < minimum:
-            raise ValueError("selected supervised depth range is empty")
-        return tuple(range(minimum, maximum + 1))
-
-    def effective_frontier(self, curriculum: CurriculumConfig) -> int:
-        if self.depth_mode == "full-curriculum":
-            return curriculum.max_depth
-        return int(self.max_depth)
 
 
 @dataclass(frozen=True)
@@ -250,7 +168,9 @@ def prepare_warm_start_data(
         by_depth[depth] = retained
 
     splits: dict[str, list[WarmStartExample]] = {
-        "train": [], "validation": [], "test": []
+        "train": [],
+        "validation": [],
+        "test": [],
     }
     selected_records: dict[str, list[dict[str, Any]]] = {}
     for depth in depths:
@@ -269,7 +189,9 @@ def prepare_warm_start_data(
                 "partition": next(
                     name for name, values in depth_splits.items() if example in values
                 ),
-                "valid_actions": [ACTION_ORDER[action] for action in example.valid_actions],
+                "valid_actions": [
+                    ACTION_ORDER[action] for action in example.valid_actions
+                ],
                 "group_ids": list(example.group_ids),
             }
             for example in by_depth[depth]
@@ -308,7 +230,9 @@ def _source_files(data_dir: Path, depths: Sequence[int]) -> dict[int, Path]:
         csv = data_dir / f"depth_{depth}.csv"
         path = parquet if parquet.exists() else csv
         if not path.exists():
-            raise ValueError(f"no labeled dataset found for depth {depth} in {data_dir}")
+            raise ValueError(
+                f"no labeled dataset found for depth {depth} in {data_dir}"
+            )
         result[depth] = path
     return result
 
@@ -362,7 +286,9 @@ def _examples_from_frame(
         group_ids = tuple(
             f"{column}:{str(row[column]).strip()}"
             for column in ("trajectory_id", "solution_id")
-            if column in frame.columns and pd.notna(row[column]) and str(row[column]).strip()
+            if column in frame.columns
+            and pd.notna(row[column])
+            and str(row[column]).strip()
         )
         record = aggregate.setdefault(
             state, {"moves": set(), "sample_ids": set(), "group_ids": set()}
@@ -374,13 +300,17 @@ def _examples_from_frame(
         WarmStartExample(
             state=state,
             depth=expected_depth,
-            valid_actions=tuple(sorted(MOVE_TO_ACTION[move] for move in values["moves"])),
+            valid_actions=tuple(
+                sorted(MOVE_TO_ACTION[move] for move in values["moves"])
+            ),
             sample_ids=tuple(sorted(values["sample_ids"])),
             group_ids=tuple(sorted(values["group_ids"])),
         )
         for state, values in aggregate.items()
     ]
-    counts["duplicate_rows_aggregated"] = len(frame) - sum(counts.values()) - len(examples)
+    counts["duplicate_rows_aggregated"] = (
+        len(frame) - sum(counts.values()) - len(examples)
+    )
     return examples, dict(counts)
 
 
@@ -413,7 +343,9 @@ def _valid_moves_from_row(row: pd.Series) -> tuple[str, ...]:
             try:
                 value = json.loads(value)
             except json.JSONDecodeError as exc:
-                raise ValueError("valid_first_solution_moves must be a JSON array") from exc
+                raise ValueError(
+                    "valid_first_solution_moves must be a JSON array"
+                ) from exc
         if not isinstance(value, (list, tuple, np.ndarray)):
             raise ValueError("valid_first_solution_moves must be a list")
         return tuple(str(move).strip() for move in value if str(move).strip())
@@ -467,7 +399,9 @@ def _split_depth_examples(
     values = list(groups.values())
     random.Random(seed).shuffle(values)
     if len(values) < 3:
-        raise ValueError("each supervised depth requires at least three independent groups")
+        raise ValueError(
+            "each supervised depth requires at least three independent groups"
+        )
     test_target = max(1, round(len(examples) * test_fraction))
     validation_target = max(1, round(len(examples) * validation_fraction))
     result = {"train": [], "validation": [], "test": []}
@@ -492,7 +426,11 @@ def _validate_split_integrity(
     }
     if any(
         state_sets[left] & state_sets[right]
-        for left, right in (("train", "validation"), ("train", "test"), ("validation", "test"))
+        for left, right in (
+            ("train", "validation"),
+            ("train", "test"),
+            ("validation", "test"),
+        )
     ):
         raise ValueError("supervised state partitions overlap")
     for name, examples in splits.items():
@@ -512,7 +450,10 @@ def depth_sampling_weights(
     if config.depth_sampling == "balanced":
         return {depth: 1.0 / len(depths) for depth in depths}
     if config.depth_sampling == "natural":
-        counts = {depth: sum(example.depth == depth for example in examples) for depth in depths}
+        counts = {
+            depth: sum(example.depth == depth for example in examples)
+            for depth in depths
+        }
         total = sum(counts.values())
         return {depth: count / total for depth, count in counts.items()}
     frontier = config.effective_frontier(curriculum)
@@ -607,15 +548,32 @@ def evaluate_classification(
     micro = _finalize_accumulator(_merge_accumulators(accumulators.values()))
     macro = {
         key: float(np.mean([values[key] for values in by_depth.values()]))
-        for key in ("loss", "top_1_accuracy", "top_3_accuracy", "macro_action_accuracy", "mean_action_confidence", "policy_entropy")
+        for key in (
+            "loss",
+            "top_1_accuracy",
+            "top_3_accuracy",
+            "macro_action_accuracy",
+            "mean_action_confidence",
+            "policy_entropy",
+        )
     }
-    return {"row_count": total_count, "micro": micro, "macro": macro, "by_depth": by_depth}
+    return {
+        "row_count": total_count,
+        "micro": micro,
+        "macro": macro,
+        "by_depth": by_depth,
+    }
 
 
 def _metric_accumulator() -> dict[str, Any]:
     return {
-        "loss": 0.0, "top1": 0, "top3": 0, "confidence": 0.0,
-        "entropy": 0.0, "count": 0, "action_total": defaultdict(int),
+        "loss": 0.0,
+        "top1": 0,
+        "top3": 0,
+        "confidence": 0.0,
+        "entropy": 0.0,
+        "count": 0,
+        "action_total": defaultdict(int),
         "action_correct": defaultdict(int),
     }
 
@@ -635,13 +593,16 @@ def _finalize_accumulator(value: Mapping[str, Any]) -> dict[str, Any]:
     count = int(value["count"])
     action_accuracies = [
         value["action_correct"][action] / total
-        for action, total in value["action_total"].items() if total
+        for action, total in value["action_total"].items()
+        if total
     ]
     return {
         "loss": value["loss"] / count if count else 0.0,
         "top_1_accuracy": value["top1"] / count if count else 0.0,
         "top_3_accuracy": value["top3"] / count if count else 0.0,
-        "macro_action_accuracy": float(np.mean(action_accuracies)) if action_accuracies else 0.0,
+        "macro_action_accuracy": float(np.mean(action_accuracies))
+        if action_accuracies
+        else 0.0,
         "mean_action_confidence": value["confidence"] / count if count else 0.0,
         "policy_entropy": value["entropy"] / count if count else 0.0,
         "row_count": count,
@@ -677,19 +638,29 @@ def evaluate_greedy_rollouts(
             previous_action: int | None = None
             entered_mastered = example.state in mastered_states
             for step in range(curriculum.max_episode_steps(depth)):
-                features = encode_sb3_state(cube.to_flat_string()).unsqueeze(0).to(device)
+                features = (
+                    encode_sb3_state(cube.to_flat_string()).unsqueeze(0).to(device)
+                )
                 with torch.no_grad():
-                    probabilities = torch.softmax(actor_logits(model, features), dim=1)[0]
+                    probabilities = torch.softmax(actor_logits(model, features), dim=1)[
+                        0
+                    ]
                 action = int(probabilities.argmax().item())
                 if step == 0:
                     first_top1 += int(action in example.valid_actions)
                     first_top3 += int(
-                        bool(set(probabilities.topk(3).indices.tolist()) & set(example.valid_actions))
+                        bool(
+                            set(probabilities.topk(3).indices.tolist())
+                            & set(example.valid_actions)
+                        )
                     )
                     confidences.append(float(probabilities.max().item()))
-                    entropies.append(float(-(probabilities * probabilities.log()).sum().item()))
+                    entropies.append(
+                        float(-(probabilities * probabilities.log()).sum().item())
+                    )
                 inverse_moves += int(
-                    previous_action is not None and action == INVERSE_ACTION[previous_action]
+                    previous_action is not None
+                    and action == INVERSE_ACTION[previous_action]
                 )
                 actions += 1
                 cube = apply_move(cube, ACTION_ORDER[action])
@@ -711,12 +682,18 @@ def evaluate_greedy_rollouts(
             "first_move_top_1_accuracy": first_top1 / count,
             "first_move_top_3_accuracy": first_top3 / count,
             "greedy_solve_rate": len(solved_moves) / count,
-            "mean_moves_to_solve": float(np.mean(solved_moves)) if solved_moves else 0.0,
-            "median_moves_to_solve": float(median(solved_moves)) if solved_moves else 0.0,
+            "mean_moves_to_solve": float(np.mean(solved_moves))
+            if solved_moves
+            else 0.0,
+            "median_moves_to_solve": float(median(solved_moves))
+            if solved_moves
+            else 0.0,
             "timeout_rate": timeouts / count,
             "inverse_move_frequency": inverse_moves / actions if actions else 0.0,
             "policy_entropy": float(np.mean(entropies)) if entropies else 0.0,
-            "average_action_confidence": float(np.mean(confidences)) if confidences else 0.0,
+            "average_action_confidence": float(np.mean(confidences))
+            if confidences
+            else 0.0,
             "mastered_region_entry_rate": entered / count,
         }
     return {"sample_cap_per_depth": sample_per_depth, "by_depth": results}
@@ -737,14 +714,19 @@ def run_supervised_warm_start(
     started = perf_counter()
     output_path = Path(output_dir)
     prepared = prepare_warm_start_data(
-        config=config, curriculum=curriculum, data_dir=data_dir,
-        output_dir=output_path, seed=seed, state_data=state_data,
+        config=config,
+        curriculum=curriculum,
+        data_dir=data_dir,
+        output_dir=output_path,
+        seed=seed,
+        state_data=state_data,
     )
     device = next(model.policy.parameters()).device
     actor_named = [
         (name, parameter)
         for name, parameter in model.policy.named_parameters()
-        if name.startswith("mlp_extractor.policy_net.") or name.startswith("action_net.")
+        if name.startswith("mlp_extractor.policy_net.")
+        or name.startswith("action_net.")
     ]
     critic_named = [
         (name, parameter)
@@ -752,10 +734,18 @@ def run_supervised_warm_start(
         if name.startswith("mlp_extractor.value_net.") or name.startswith("value_net.")
     ]
     if not actor_named or not critic_named:
-        raise ValueError("loaded SB3 checkpoint architecture is incompatible with actor warm start")
-    critic_before = {name: parameter.detach().cpu().clone() for name, parameter in critic_named}
-    initial_actor = {name: parameter.detach().cpu().clone() for name, parameter in actor_named}
-    weights = depth_sampling_weights(config, curriculum, prepared.depths, prepared.splits["train"])
+        raise ValueError(
+            "loaded SB3 checkpoint architecture is incompatible with actor warm start"
+        )
+    critic_before = {
+        name: parameter.detach().cpu().clone() for name, parameter in critic_named
+    }
+    initial_actor = {
+        name: parameter.detach().cpu().clone() for name, parameter in actor_named
+    }
+    weights = depth_sampling_weights(
+        config, curriculum, prepared.depths, prepared.splits["train"]
+    )
     mastered_states = {
         example.state
         for split in prepared.splits.values()
@@ -765,16 +755,23 @@ def run_supervised_warm_start(
     before = {
         "classification": {
             split: evaluate_classification(
-                model, examples, batch_size=config.batch_size,
-                smoothing=config.label_smoothing, device=device,
+                model,
+                examples,
+                batch_size=config.batch_size,
+                smoothing=config.label_smoothing,
+                device=device,
             )
             for split, examples in prepared.splits.items()
             if split in ("train", "validation")
         },
         "rollouts": {
             split: evaluate_greedy_rollouts(
-                model, examples, sample_per_depth=config.rollout_sample_per_depth,
-                seed=seed, curriculum=curriculum, mastered_states=mastered_states,
+                model,
+                examples,
+                sample_per_depth=config.rollout_sample_per_depth,
+                seed=seed,
+                curriculum=curriculum,
+                mastered_states=mastered_states,
                 device=device,
             )
             for split, examples in prepared.splits.items()
@@ -794,10 +791,14 @@ def run_supervised_warm_start(
     best_path = output_path / "supervised_warm_start_best.pt"
     for epoch in range(1, config.epochs + 1):
         indices = epoch_indices(
-            prepared.splits["train"], weights=weights,
-            strategy=config.depth_sampling, seed=seed + epoch,
+            prepared.splits["train"],
+            weights=weights,
+            strategy=config.depth_sampling,
+            seed=seed + epoch,
         )
-        loader = DataLoader(train_dataset, batch_size=config.batch_size, sampler=indices)
+        loader = DataLoader(
+            train_dataset, batch_size=config.batch_size, sampler=indices
+        )
         model.policy.train()
         for features, targets, _ in loader:
             features, targets = features.to(device), targets.to(device)
@@ -810,12 +811,18 @@ def run_supervised_warm_start(
             )
             optimizer.step()
         train_metrics = evaluate_classification(
-            model, prepared.splits["train"], batch_size=config.batch_size,
-            smoothing=config.label_smoothing, device=device,
+            model,
+            prepared.splits["train"],
+            batch_size=config.batch_size,
+            smoothing=config.label_smoothing,
+            device=device,
         )
         validation_metrics = evaluate_classification(
-            model, prepared.splits["validation"], batch_size=config.batch_size,
-            smoothing=config.label_smoothing, device=device,
+            model,
+            prepared.splits["validation"],
+            batch_size=config.batch_size,
+            smoothing=config.label_smoothing,
+            device=device,
         )
         row = {"epoch": epoch, "train": train_metrics, "validation": validation_metrics}
         history.append(row)
@@ -825,15 +832,21 @@ def run_supervised_warm_start(
         if improved:
             best_loss, best_accuracy, best_epoch = macro_loss, macro_accuracy, epoch
             best_state = {
-                name: parameter.detach().cpu().clone() for name, parameter in actor_named
+                name: parameter.detach().cpu().clone()
+                for name, parameter in actor_named
             }
             stale_epochs = 0
         else:
             stale_epochs += 1
         checkpoint_base = _checkpoint_payload(
-            model=model, config=config, prepared=prepared, seed=seed,
-            updated_names=[name for name, _ in actor_named], best_epoch=best_epoch,
-            history=history, validation_metrics=validation_metrics,
+            model=model,
+            config=config,
+            prepared=prepared,
+            seed=seed,
+            updated_names=[name for name, _ in actor_named],
+            best_epoch=best_epoch,
+            history=history,
+            validation_metrics=validation_metrics,
             runtime=perf_counter() - started,
         )
         torch.save(checkpoint_base, last_path)
@@ -848,25 +861,35 @@ def run_supervised_warm_start(
         current[name].data.copy_(value.to(current[name].device))
     for name, parameter in critic_named:
         if not torch.equal(parameter.detach().cpu(), critic_before[name]):
-            raise RuntimeError(f"critic parameter changed during actor warm start: {name}")
+            raise RuntimeError(
+                f"critic parameter changed during actor warm start: {name}"
+            )
     actor_changed = [
-        name for name, parameter in actor_named
+        name
+        for name, parameter in actor_named
         if not torch.equal(parameter.detach().cpu(), initial_actor[name])
     ]
     if not actor_changed:
         raise RuntimeError("supervised warm start did not update actor parameters")
     after_classification = {
         split: evaluate_classification(
-            model, examples, batch_size=config.batch_size,
-            smoothing=config.label_smoothing, device=device,
+            model,
+            examples,
+            batch_size=config.batch_size,
+            smoothing=config.label_smoothing,
+            device=device,
         )
         for split, examples in prepared.splits.items()
         if split in ("train", "validation")
     }
     after_rollouts = {
         split: evaluate_greedy_rollouts(
-            model, examples, sample_per_depth=config.rollout_sample_per_depth,
-            seed=seed, curriculum=curriculum, mastered_states=mastered_states,
+            model,
+            examples,
+            sample_per_depth=config.rollout_sample_per_depth,
+            seed=seed,
+            curriculum=curriculum,
+            mastered_states=mastered_states,
             device=device,
         )
         for split, examples in prepared.splits.items()
@@ -888,7 +911,9 @@ def run_supervised_warm_start(
     }
     torch.save(final_best_payload, best_path)
     reference_examples = _diagnostic_examples(
-        prepared.splits["validation"], cap_per_depth=min(100, config.rollout_sample_per_depth), seed=seed
+        prepared.splits["validation"],
+        cap_per_depth=min(100, config.rollout_sample_per_depth),
+        seed=seed,
     )
     reference_probs = policy_probabilities(model, reference_examples, device=device)
     manifest_hash = _sha256_file(prepared.manifest_path)
@@ -932,7 +957,8 @@ def run_supervised_warm_start(
         "metrics": {
             "before_supervised_pretraining": before,
             "after_supervised_pretraining": {
-                "classification": after_classification, "rollouts": after_rollouts
+                "classification": after_classification,
+                "rollouts": after_rollouts,
             },
             "training_history": history,
         },
@@ -943,81 +969,14 @@ def run_supervised_warm_start(
     }
 
 
-def _checkpoint_payload(
-    *, model: Any, config: SupervisedWarmStartConfig,
-    prepared: PreparedWarmStartData, seed: int, updated_names: Sequence[str],
-    best_epoch: int, history: Sequence[Mapping[str, Any]],
-    validation_metrics: Mapping[str, Any], runtime: float,
-) -> dict[str, Any]:
-    return {
-        "model_state_dict": model.policy.state_dict(),
-        "architecture_version": MODEL_ARCHITECTURE_VERSION,
-        "observation_schema": {
-            "observation_encoding": OBSERVATION_ENCODING,
-            "observation_shape": list(OBSERVATION_SHAPE),
-            "state_encoder_version": STATE_ENCODER_VERSION,
-        },
-        "action_schema": {"action_count": ACTION_COUNT, "action_order": list(ACTION_ORDER)},
-        "selected_depth_range": [prepared.depths[0], prepared.depths[-1]],
-        "depth_mode": config.depth_mode,
-        "dataset_counts": prepared.manifest["dataset_counts"],
-        "train_counts_by_depth": prepared.manifest["split_counts"]["train"],
-        "validation_counts_by_depth": prepared.manifest["split_counts"]["validation"],
-        "test_counts_by_depth": prepared.manifest["split_counts"]["test"],
-        "split_manifest_reference": str(prepared.manifest_path),
-        "sampling_strategy": config.depth_sampling,
-        "seed": seed,
-        "hyperparameters": asdict(config),
-        "updated_parameter_groups": list(updated_names),
-        "shared_encoder_updated": False,
-        "critic_head_updated": False,
-        "best_epoch": best_epoch,
-        "training_history": list(history),
-        "validation_metrics": dict(validation_metrics),
-        "dataset_identifiers": prepared.manifest["selected_rows"],
-        "dataset_hashes": prepared.manifest["source_files"],
-        "runtime": runtime,
-        "software_versions": {
-            "python": platform.python_version(),
-            "torch": torch.__version__,
-        },
-    }
-
-
-def load_supervised_warm_start_checkpoint(model: Any, path: Path | str) -> dict[str, Any]:
-    """Validate schema compatibility and restore a supervised policy checkpoint."""
-
-    payload = torch.load(Path(path), map_location=next(model.policy.parameters()).device, weights_only=False)
-    if payload.get("architecture_version") != MODEL_ARCHITECTURE_VERSION:
-        raise ValueError("supervised checkpoint architecture version mismatch")
-    observation = payload.get("observation_schema", {})
-    if observation.get("observation_encoding") != OBSERVATION_ENCODING or tuple(
-        observation.get("observation_shape", ())
-    ) != OBSERVATION_SHAPE:
-        raise ValueError("supervised checkpoint observation schema mismatch")
-    action = payload.get("action_schema", {})
-    if action.get("action_count") != ACTION_COUNT or tuple(action.get("action_order", ())) != ACTION_ORDER:
-        raise ValueError("supervised checkpoint action order mismatch")
-    model.policy.load_state_dict(payload["model_state_dict"])
-    return payload
-
-
-def reset_ppo_optimizer(model: Any) -> None:
-    """Discard supervised/PPO momentum and create a fresh full-policy optimizer."""
-
-    model.policy.optimizer = model.policy.optimizer_class(
-        model.policy.parameters(),
-        lr=model.lr_schedule(1),
-        **model.policy.optimizer_kwargs,
-    )
-
-
 def policy_probabilities(
     model: Any, examples: Sequence[WarmStartExample], *, device: torch.device
 ) -> torch.Tensor:
     if not examples:
         return torch.empty((0, ACTION_COUNT))
-    features = torch.stack([encode_sb3_state(example.state) for example in examples]).to(device)
+    features = torch.stack(
+        [encode_sb3_state(example.state) for example in examples]
+    ).to(device)
     with torch.no_grad():
         return torch.softmax(actor_logits(model, features), dim=1).cpu()
 
@@ -1038,15 +997,28 @@ def transition_snapshot(
     current = policy_probabilities(model, examples, device=device)
     reference = reference_probabilities.clamp_min(1e-8)
     current_safe = current.clamp_min(1e-8)
-    kl = float((reference * (reference.log() - current_safe.log())).sum(dim=1).mean()) if len(current) else 0.0
-    classification = evaluate_classification(
-        model, examples, batch_size=max(1, min(256, len(examples))),
-        smoothing=0.0, device=device,
-    ) if examples else {}
+    kl = (
+        float((reference * (reference.log() - current_safe.log())).sum(dim=1).mean())
+        if len(current)
+        else 0.0
+    )
+    classification = (
+        evaluate_classification(
+            model,
+            examples,
+            batch_size=max(1, min(256, len(examples))),
+            smoothing=0.0,
+            device=device,
+        )
+        if examples
+        else {}
+    )
     values = dict(logger_values or {})
+
     def metric(name: str) -> float | None:
         value = values.get(name)
         return None if value is None else float(value)
+
     snapshot = {
         "phase": phase,
         "timesteps": int(model.num_timesteps),

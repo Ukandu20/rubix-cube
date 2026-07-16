@@ -5,12 +5,10 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Optional
 
 from cube.environment import ACTION_TO_MOVE, CubeEnvironment
 from cube.moves import apply_move
 from cube.notation import Move, parse_move
-from cube.state import CubeState
 
 
 @dataclass(frozen=True)
@@ -40,7 +38,7 @@ class BFSAgent:
         self.prune_inverse = prune_inverse
         self.actions = tuple(ACTION_TO_MOVE.values())
 
-    def legal_moves(self, previous_move: Optional[str] = None) -> list[str]:
+    def legal_moves(self, previous_move: str | None = None) -> list[str]:
         """Return legal move tokens, optionally pruning immediate inverses."""
 
         if not self.prune_inverse or previous_move is None:

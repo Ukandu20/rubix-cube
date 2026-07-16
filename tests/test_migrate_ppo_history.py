@@ -1,16 +1,13 @@
 import csv
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.migrate_ppo_history import migrate_metrics_file, migrate_tree  # noqa: E402
 from agents.ppo_agent import write_history_csv  # noqa: E402
+from scripts.migrate_ppo_history import migrate_metrics_file, migrate_tree  # noqa: E402
 
 
 class PPOHistoryCsvTests(unittest.TestCase):

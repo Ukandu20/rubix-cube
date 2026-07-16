@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import pandas as pd
-
 
 DEFAULT_BEHAVIOR_LOG_ROOT = Path("data/logs")
 
@@ -70,14 +70,14 @@ class BehaviorLogger:
 def timestamp_run_id(prefix: str = "eval") -> str:
     """Return a filesystem-friendly timestamped run identifier."""
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"{prefix}_{timestamp}"
 
 
 def utc_timestamp() -> str:
     """Return an ISO timestamp for log rows."""
 
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _safe_path_component(value: str) -> str:

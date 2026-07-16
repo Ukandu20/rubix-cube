@@ -1,6 +1,5 @@
 import csv
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +11,6 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from agents.sb3_ppo_agent import OneHotObservation, SB3PPOConfig, train_sb3_ppo
 from agents.sb3_supervised_warm_start import (
@@ -77,19 +75,27 @@ class SupervisedWarmStartTests(unittest.TestCase):
     def test_depth_modes_resolve_exact_ranges(self):
         cfg = curriculum(10)
         self.assertEqual(
-            SupervisedWarmStartConfig(depth_mode="mastered", max_depth=6).selected_depths(cfg),
+            SupervisedWarmStartConfig(
+                depth_mode="mastered", max_depth=6
+            ).selected_depths(cfg),
             tuple(range(1, 6)),
         )
         self.assertEqual(
-            SupervisedWarmStartConfig(depth_mode="frontier", max_depth=6).selected_depths(cfg),
+            SupervisedWarmStartConfig(
+                depth_mode="frontier", max_depth=6
+            ).selected_depths(cfg),
             tuple(range(1, 7)),
         )
         self.assertEqual(
-            SupervisedWarmStartConfig(depth_mode="full-curriculum").selected_depths(cfg),
+            SupervisedWarmStartConfig(depth_mode="full-curriculum").selected_depths(
+                cfg
+            ),
             tuple(range(1, 11)),
         )
         self.assertEqual(
-            SupervisedWarmStartConfig(depth_mode="custom", min_depth=3, max_depth=5).selected_depths(cfg),
+            SupervisedWarmStartConfig(
+                depth_mode="custom", min_depth=3, max_depth=5
+            ).selected_depths(cfg),
             (3, 4, 5),
         )
 
@@ -120,19 +126,30 @@ class SupervisedWarmStartTests(unittest.TestCase):
             root = Path(directory)
             data = root / "data"
             data.mkdir()
-            rows = [example.to_row() for example in generate_depth_dataset(1, 12, unique=True)]
-            rows.append({**rows[0], "sample_id": "duplicate", "first_solution_move": "U"})
+            rows = [
+                example.to_row()
+                for example in generate_depth_dataset(1, 12, unique=True)
+            ]
+            rows.append(
+                {**rows[0], "sample_id": "duplicate", "first_solution_move": "U"}
+            )
             self._write_rows(data / "depth_1.csv", rows)
             config = SupervisedWarmStartConfig(
                 depth_mode="frontier", max_depth=1, sample_per_depth=12
             )
             first = prepare_warm_start_data(
-                config=config, curriculum=curriculum(1), data_dir=data,
-                output_dir=root / "first", seed=42,
+                config=config,
+                curriculum=curriculum(1),
+                data_dir=data,
+                output_dir=root / "first",
+                seed=42,
             )
             second = prepare_warm_start_data(
-                config=config, curriculum=curriculum(1), data_dir=data,
-                output_dir=root / "second", seed=42,
+                config=config,
+                curriculum=curriculum(1),
+                data_dir=data,
+                output_dir=root / "second",
+                seed=42,
             )
 
             first_hashes = {
@@ -152,7 +169,8 @@ class SupervisedWarmStartTests(unittest.TestCase):
             manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["dataset_counts"], {"1": 12})
             aggregated = [
-                row for row in manifest["selected_rows"]["1"]
+                row
+                for row in manifest["selected_rows"]["1"]
                 if "duplicate" in row["sample_ids"]
             ]
             self.assertEqual(len(aggregated), 1)
@@ -160,15 +178,16 @@ class SupervisedWarmStartTests(unittest.TestCase):
                 config=SupervisedWarmStartConfig(
                     depth_mode="frontier", max_depth=1, sample_per_depth=9
                 ),
-                curriculum=curriculum(1), data_dir=data,
-                output_dir=root / "capped", seed=42,
+                curriculum=curriculum(1),
+                data_dir=data,
+                output_dir=root / "capped",
+                seed=42,
             )
             self.assertEqual(sum(map(len, capped.splits.values())), 9)
 
     def test_depth_samplers_follow_declared_probabilities(self):
         examples = [
-            WarmStartExample(str(index), 1, (0,), (str(index),))
-            for index in range(10)
+            WarmStartExample(str(index), 1, (0,), (str(index),)) for index in range(10)
         ] + [
             WarmStartExample(str(index), 2, (0,), (str(index),))
             for index in range(10, 40)
@@ -182,9 +201,18 @@ class SupervisedWarmStartTests(unittest.TestCase):
         weighted = SupervisedWarmStartConfig(
             depth_mode="frontier", max_depth=2, depth_sampling="frontier-weighted"
         )
-        self.assertEqual(depth_sampling_weights(balanced, curriculum(2), (1, 2), examples), {1: 0.5, 2: 0.5})
-        self.assertEqual(depth_sampling_weights(natural, curriculum(2), (1, 2), examples), {1: 0.25, 2: 0.75})
-        self.assertEqual(depth_sampling_weights(weighted, curriculum(2), (1, 2), examples), {1: 0.5, 2: 0.5})
+        self.assertEqual(
+            depth_sampling_weights(balanced, curriculum(2), (1, 2), examples),
+            {1: 0.5, 2: 0.5},
+        )
+        self.assertEqual(
+            depth_sampling_weights(natural, curriculum(2), (1, 2), examples),
+            {1: 0.25, 2: 0.75},
+        )
+        self.assertEqual(
+            depth_sampling_weights(weighted, curriculum(2), (1, 2), examples),
+            {1: 0.5, 2: 0.5},
+        )
         indices = epoch_indices(
             examples,
             weights={1: 0.0, 2: 1.0},
@@ -199,7 +227,10 @@ class SupervisedWarmStartTests(unittest.TestCase):
             data = root / "data"
             output = root / "output"
             data.mkdir()
-            rows = [example.to_row() for example in generate_depth_dataset(1, 12, unique=True)]
+            rows = [
+                example.to_row()
+                for example in generate_depth_dataset(1, 12, unique=True)
+            ]
             self._write_rows(data / "depth_1.csv", rows)
             model = make_model()
             critic_before = {
@@ -210,12 +241,17 @@ class SupervisedWarmStartTests(unittest.TestCase):
             result = run_supervised_warm_start(
                 model,
                 config=SupervisedWarmStartConfig(
-                    depth_mode="frontier", max_depth=1, epochs=1,
-                    batch_size=4, sample_per_depth=12,
+                    depth_mode="frontier",
+                    max_depth=1,
+                    epochs=1,
+                    batch_size=4,
+                    sample_per_depth=12,
                     rollout_sample_per_depth=1,
                 ),
-                curriculum=curriculum(1), data_dir=data,
-                output_dir=output, seed=4,
+                curriculum=curriculum(1),
+                data_dir=data,
+                output_dir=output,
+                seed=4,
             )
 
             self.assertTrue((output / "supervised_warm_start_best.pt").exists())
@@ -227,7 +263,9 @@ class SupervisedWarmStartTests(unittest.TestCase):
             payload = load_supervised_warm_start_checkpoint(
                 model, output / "supervised_warm_start_best.pt"
             )
-            self.assertEqual(tuple(payload["action_schema"]["action_order"]), ACTION_ORDER)
+            self.assertEqual(
+                tuple(payload["action_schema"]["action_order"]), ACTION_ORDER
+            )
             payload["action_schema"]["action_order"] = list(reversed(ACTION_ORDER))
             incompatible = output / "incompatible.pt"
             torch.save(payload, incompatible)
@@ -240,7 +278,10 @@ class SupervisedWarmStartTests(unittest.TestCase):
             data = root / "data"
             output = root / "output"
             data.mkdir()
-            rows = [example.to_row() for example in generate_depth_dataset(1, 12, unique=True)]
+            rows = [
+                example.to_row()
+                for example in generate_depth_dataset(1, 12, unique=True)
+            ]
             self._write_rows(data / "depth_1.csv", rows)
 
             result = train_sb3_ppo(
@@ -254,8 +295,11 @@ class SupervisedWarmStartTests(unittest.TestCase):
                     n_steps=2, batch_size=2, n_epochs=1, hidden_layers=(16,)
                 ),
                 supervised_config=SupervisedWarmStartConfig(
-                    depth_mode="frontier", max_depth=1, epochs=1,
-                    batch_size=4, sample_per_depth=9,
+                    depth_mode="frontier",
+                    max_depth=1,
+                    epochs=1,
+                    batch_size=4,
+                    sample_per_depth=9,
                     rollout_sample_per_depth=1,
                 ),
                 seed=5,
@@ -282,7 +326,9 @@ class SupervisedWarmStartTests(unittest.TestCase):
     def _write_rows(self, path, rows):
         fieldnames = list(FIELDNAMES)
         with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer = csv.DictWriter(
+                handle, fieldnames=fieldnames, extrasaction="ignore"
+            )
             writer.writeheader()
             writer.writerows(rows)
 
